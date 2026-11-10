@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Entry Condition="'$(MILLION_USERS_ENTRY)' != ''">$(MILLION_USERS_ENTRY)/</Entry>
+    <Entry Condition="'$(Entry)' == ''">$(MSBuildThisFileDirectory)../../submissions/csharp-epoll-xeonfx/</Entry>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="4.0.2" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.13" />
+    <PackageReference Include="FsCheck.Xunit.v3" Version="3.5.0" />
+    <Compile Include="$(Entry)*.cs" Exclude="$(Entry)Program.cs" Link="Entry/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
