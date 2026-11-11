@@ -319,8 +319,8 @@ public sealed class FakePgTests : IDisposable
     /// it (its guard, then nudges while the fake holds its answer) aren't batches.</summary>
     static string[] Batches(string log) => [.. System.Text.RegularExpressions.Regex.Matches(log, "[a-z]+S").Select(m => m.Value[..^1])];
 
-    /// <summary>The server's connections in one loop: 456 readers and 8 writers.</summary>
-    const int Connections = 464;
+    /// <summary>The server's connections in one loop: 488 readers and 8 writers.</summary>
+    const int Connections = 496;
 
     [Fact]
     public void TheServerRunsOneLoopWithMostOfPostgresConnections()

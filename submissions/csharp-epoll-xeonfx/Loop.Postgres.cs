@@ -83,7 +83,8 @@ sealed partial class Loop
     /// rows come back as one stream, so a lost packet holds up every read behind it, and the longer the stream, the
     /// likelier one of its packets is lost twice. While reads wait through retransmit timers, batches are halved:
     /// more of them, on more readers, each less exposed. Once they stop, batches grow back, because fewer and
-    /// fuller packets are what a healthy network wants.</summary>
+    /// fuller packets are what a healthy network wants; and they grow whenever nearly every reader is busy, because
+    /// a small batch behind another on a busy reader is worse off than a large one on its own.</summary>
     int _batch = Pg.MaxBatch;
     /// <summary>How many readers take turns: twice as many as were busy lately, <see cref="FewestTurns"/> at least.
     /// On a quiet network a few carry every pass and Postgres keeps as few backends warm; under loss, batches take
@@ -110,16 +111,17 @@ sealed partial class Loop
         _busyPeak = Math.Max(busy, _busyPeak * 3 / 4);
         _turns = Math.Max(FewestTurns, 2 * _busyPeak + 4);
         if (_judged < JudgeReads) return;
-        _batch = NextBatch(_batch, _judged, _late);
+        _batch = NextBatch(_batch, _judged, _late, busy, _readers);
         _judged = _late = 0;
     }
 
-    /// <summary>The batch size after a judgment: half when more than 1 % of the reads waited long, double when
-    /// fewer than 0.25 % did, within <see cref="SmallestBatch"/> and <see cref="Pg.MaxBatch"/>.</summary>
-    internal static int NextBatch(int batch, int reads, int late)
+    /// <summary>The batch size after a judgment: double when nine readers in ten are busy (there is no reader left
+    /// for more batches) or fewer than 0.25 % of the reads waited long, half when more than 1 % did, within
+    /// <see cref="SmallestBatch"/> and <see cref="Pg.MaxBatch"/>.</summary>
+    internal static int NextBatch(int batch, int reads, int late, int busy, int readers)
     {
+        if (busy * 10L >= readers * 9L || late * 400L < reads) return Math.Min(batch * 2, Pg.MaxBatch);
         if (late * 100L > reads) return Math.Max(batch / 2, SmallestBatch);
-        if (late * 400L < reads) return Math.Min(batch * 2, Pg.MaxBatch);
         return batch;
     }
 

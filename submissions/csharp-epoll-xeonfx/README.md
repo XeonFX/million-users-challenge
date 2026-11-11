@@ -22,25 +22,48 @@ CRC-32.
   well inside the 40 ms after which the kernel would ack the request in a packet of its own.
 - **Postgres: a pass's reads are one batch.** They go to one read connection as Bind/Execute pairs under a single
   Sync: one packet out, one wake-up of one backend, one ReadyForQuery back. Past 64 reads the next connection takes
-  over. The connection with the fewest reads waiting gets the pass, the first of them, so while the first ones keep
-  up they carry every pass and the rest stay free (8 read connections a loop on 4 cores, 2 on 16; about 32 in all).
-  Each read is answered as soon as its rows are in; if one fails, the reads after it in the batch are sent again.
-  The spec's statements are prepared once and their parameters are binary.
+  over. A batch goes to a reader with nothing else waiting, and the readers take turns: eight of them on a quiet
+  network, so Postgres keeps few backends warm, and more as batches take longer. Each read is answered as soon as
+  its rows are in; if one fails, the reads after it in the batch are sent again. The spec's statements are prepared
+  once and their parameters are binary.
 - **Fewer bytes from Postgres.** Its replies are most of what the app box takes in, and the box's network runs out
   before its CPU does. So each column of a post comes in whichever format is shorter: `id` and `like_count` as text
   (six digits and one or two, against 8 and 4 bytes binary), `created_at` binary (8 bytes against 29) and formatted
   straight from microseconds. The digits go into the JSON as they are.
 - **Group commit for writes, on write connections of their own.** A pass's new posts and likes go out together as
-  one transaction (one Sync, one commit) on a write connection that has no group out (4 a loop on 4 cores, 2 on 8
-  and 16). While all of them wait for their commit, new writes queue and leave as one group with the pass that
+  one transaction (one Sync, one commit) on a write connection that has no group out (8 a loop on 4 cores, 4 on 8,
+  2 on 16). While all of them wait for their commit, new writes queue and leave as one group with the pass that
   finds one free. So a commit that is slow, or whose packet was lost, holds up its own group and nothing behind it,
   and reads never wait for a commit. If a write fails (a like on a missing post), it gets its error and the rest
   of its group are sent again.
-- **Recovery on silent Postgres connections.** A quiet connection with a lost segment can wait for its
-  retransmission timeout. A Postgres connection that owes replies and has been silent for 50 ms gets a lone Sync,
-  with exponential backoff until data arrives. The extra traffic can trigger earlier loss detection. A writer
-  tracks each nudge separately, so its reply can never acknowledge another write group's commit. Every socket
-  also uses `TCP_THIN_LINEAR_TIMEOUTS` to limit timeout backoff for small amounts of data in flight.
+- **Built for a network that loses packets.** Near its limit the scoring box's network drops packets, and what gives
+  way first is the rows coming from Postgres: failed runs on boxes like it (nish-std-amritk's) and runs with packets
+  dropped on purpose (below) both show reads taking seconds while writes still take 220 ms.
+  On a pipelined connection one lost packet holds up every read behind it. A packet with none after it (the last
+  of an exchange, or one that was lost again when it was resent) waits out a timer of 200 ms that doubles. And TCP
+  at Postgres's end shrinks the connection's window at every loss, so a few connections that carry everything stop
+  carrying it. This is what keeps the reads moving:
+  - *A guard behind every batch and group.* One more Sync, sent as a packet of its own. It carries nothing; it is
+    there to be the last packet instead of the work. A lost batch is then reported by the guard's arrival, and a
+    lost end of a reply by the guard's ReadyForQuery, which Postgres sends in a packet of its own right after the
+    reply. A lost guard costs nothing: nobody waits for it.
+  - *Nudges.* A connection that owes replies and has been silent for 5 ms (20 ms for a writer: a commit waits for
+    its WAL flush) gets a lone Sync, and another every 5 ms while it stays silent, four of them, then less often,
+    down to one every 80 ms. Each reaches Postgres past the hole, or its ReadyForQuery reaches the server past it,
+    and the side that sent the lost packet resends it at once. On a quiet network none are sent.
+  - *Readers by the hundred.* 496 connections in all, under the 512 of rule 5: 116 readers a loop on 4 cores, 58 on
+    8, 29 on 16. A quiet network uses eight a loop. Under loss a batch takes longer, more are out at once, and each
+    is on a reader of its own: a reader that has gone silent on what it owes is never given a batch while another
+    answers.
+  - *Smaller batches while it lasts.* When more than 1 % of the reads have waited 350 ms or more (through more than
+    one timer), the batch size halves, each quarter of a second, down to 4: more batches, each a shorter stream
+    with fewer packets to lose and fewer reads behind them. When fewer than 0.25 % have, it doubles again, back to
+    64, because fewer and fuller packets are what a healthy network wants. It also doubles while nine readers in
+    ten are busy: more batches need more readers.
+
+  No statement runs twice for this: a read is sent once, on one connection, and waits for it. A Sync is not a
+  query. Every socket also uses `TCP_THIN_LINEAR_TIMEOUTS` to limit timeout backoff for small amounts of data in
+  flight.
 - **Fewer packets per client request.** Clients inherit their TCP options from the listener, with no call per
   connection: `TCP_NODELAY`, `TCP_THIN_LINEAR_TIMEOUTS`, `TCP_DEFER_ACCEPT` and delayed-ACK mode (`TCP_QUICKACK`
   off). With `TCP_DEFER_ACCEPT` a connection is handed over once its first request is in, and that request is read

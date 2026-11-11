@@ -539,7 +539,22 @@ public sealed class PassTests
     [InlineData(16, int.MaxValue, 0, 32)]
     public void ABatchHalvesWhenMoreThanOneInAHundredReadsWaitedLongAndDoublesWhenFewerThanOneInFourHundredDid(int batch, int reads, int late, int next)
     {
-        Assert.Equal(next, Loop.NextBatch(batch, reads, late));
+        Assert.Equal(next, Loop.NextBatch(batch, reads, late, busy: 1, readers: 100));
+    }
+
+    [Theory]
+    [InlineData(8, 89, 100, 4)]     // readers to spare: the late reads halve it
+    [InlineData(8, 90, 100, 16)]    // nine in ten busy: no reader for more batches, so larger ones
+    [InlineData(8, 100, 100, 16)]
+    [InlineData(64, 100, 100, 64)]  // already the largest
+    [InlineData(8, 8, 9, 4)]        // 8 of 9 is short of nine in ten
+    [InlineData(8, 9, 10, 16)]
+    [InlineData(8, 1, 1, 16)]       // a loop's only reader, busy
+    [InlineData(8, 0, 1, 4)]
+    [InlineData(8, int.MaxValue, int.MaxValue, 16)] // no overflow
+    public void ABatchGrowsWhileNineReadersInTenAreBusyHoweverLongTheReadsWait(int batch, int busy, int readers, int next)
+    {
+        Assert.Equal(next, Loop.NextBatch(batch, reads: 1000, late: 1000, busy, readers));
     }
 
     [Fact]
@@ -548,14 +563,19 @@ public sealed class PassTests
         var judgments = from batch in Gen.Elements(4, 8, 16, 32, 64)
                         from reads in Gen.Choose(100, 100_000)
                         from late in Gen.Choose(0, 100_000)
-                        select (batch, reads, late: Math.Min(late, reads));
+                        from readers in Gen.Choose(1, 500)
+                        from busy in Gen.Choose(0, 500)
+                        select (batch, reads, late: Math.Min(late, reads), busy: Math.Min(busy, readers), readers);
         Prop.ForAll(judgments.ToArbitrary(), j =>
         {
-            int next = Loop.NextBatch(j.batch, j.reads, j.late);
+            int next = Loop.NextBatch(j.batch, j.reads, j.late, j.busy, j.readers);
             Assert.InRange(next, Loop.SmallestBatch, Pg.MaxBatch);
             Assert.Contains(next, new[] { j.batch / 2, j.batch, j.batch * 2 });
-            // more late reads never give a larger batch
-            Assert.True(Loop.NextBatch(j.batch, j.reads, Math.Min(j.reads, j.late + j.reads / 50 + 1)) <= next);
+            // with readers to spare, more late reads never give a larger batch
+            if (j.busy * 10 < j.readers * 9)
+                Assert.True(Loop.NextBatch(j.batch, j.reads, Math.Min(j.reads, j.late + j.reads / 50 + 1), j.busy, j.readers) <= next);
+            // and more busy readers never give a smaller one
+            Assert.True(Loop.NextBatch(j.batch, j.reads, j.late, j.readers, j.readers) >= next);
         }).QuickCheckThrowOnFailure();
     }
 
