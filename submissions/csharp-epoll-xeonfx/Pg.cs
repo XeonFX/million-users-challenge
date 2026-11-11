@@ -52,11 +52,12 @@ sealed class WriteJob
 /// </summary>
 sealed class Pg
 {
+    internal static int Env(string name, int fallback) => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) ? v : fallback;
+
     public const byte Health = (byte)'h', Feed = (byte)'f', Post = (byte)'p', CreatePost = (byte)'c', LikePost = (byte)'l';
     /// <summary>The most reads under one Sync. A loop pass's reads go to one reader until it holds this many.</summary>
-    public const int MaxBatch = 64;
+    public static readonly int MaxBatch = Env("MU_MAX_BATCH", 64);
     // ---- lab switches (this branch only): the defaults are the scored version's behaviour
-    static int Env(string name, int fallback) => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) ? v : fallback;
 
     /// <summary>How long a connection that owes replies may stay silent before it is nudged with a Sync, in
     /// milliseconds. A batch's rows come 8 KB at a time, a millisecond or two apart, so a reader this quiet has most

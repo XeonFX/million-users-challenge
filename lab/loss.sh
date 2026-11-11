@@ -23,12 +23,30 @@ inpg() { sudo nsenter -t "$pgpid" -n "$@"; }
 
 # removes every rule of ours from the built-in chains, then our chains, here and in Postgres's namespace
 clear_in() {
-  "$@" iptables -S | grep -E '^-A (INPUT|OUTPUT) .*-j MU_' | sed 's/^-A/-D/' | while read -r rule; do "$@" iptables $rule; done
+  { "$@" iptables -S 2>/dev/null | grep -E '^-A (INPUT|OUTPUT) .*-j MU_' || true; } | sed 's/^-A/-D/' |
+    while read -r rule; do "$@" iptables $rule || true; done
   for c in MU_COUNT MU_LOSS; do "$@" iptables -F $c 2>/dev/null || true; "$@" iptables -X $c 2>/dev/null || true; done
 }
 clear_rules() { clear_in sudo; clear_in sudo nsenter -t "$pgpid" -n; }
 trap clear_rules EXIT
 clear_rules
+
+# the Postgres link as a wire: one packet per segment (no segmentation offload, which would make a drop a burst of
+# up to 45 segments), and a datacenter's delay each way where the kernel has netem
+bridge=$(ip -o route get "$pgip" | grep -o 'dev [^ ]*' | cut -d' ' -f2)
+for i in $(ls /sys/class/net | grep -E '^(veth|br-|docker)' || true); do
+  sudo ethtool -K "$i" tso off gso off gro off >/dev/null 2>&1 || true
+done
+inpg ethtool -K eth0 tso off gso off gro off >/dev/null 2>&1 || true
+delay=${PG_DELAY_US:-100}
+if [ "$delay" != 0 ]; then
+  if sudo tc qdisc replace dev "$bridge" root netem delay "${delay}us" limit 100000 2>/dev/null &&
+     inpg tc qdisc replace dev eth0 root netem delay "${delay}us" limit 100000 2>/dev/null; then
+    echo "Postgres link: ${delay} us each way"
+  else
+    echo "no netem here: the Postgres link has no added delay"
+  fi
+fi
 
 psql -qX -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE IF EXISTS $DB WITH (FORCE)" -c "CREATE DATABASE $DB TEMPLATE feed_seed"
 
@@ -42,7 +60,7 @@ count -i lo --sport 3000:3001                                  # 4 server -> cli
 count -i lo --dport 3000:3001 -m length --length 0:80          # 5 clients -> server, no payload
 count -i lo --dport 3000:3001                                  # 6 clients -> server, requests
 sudo iptables -I INPUT -j MU_COUNT
-sudo iptables -I OUTPUT -o "$(ip -o route get "$pgip" | grep -o 'dev [^ ]*' | cut -d' ' -f2)" -j MU_COUNT
+sudo iptables -I OUTPUT -o "$bridge" -j MU_COUNT
 
 sudo bash -c "ulimit -n 2000000; cd '$entry' && exec taskset -c $cpus env $extra DATABASE_URL=postgres://postgres:postgres@$pgip:5432/$DB \
   JWT_SECRET=million-users-challenge HOST=0.0.0.0 PORT=3000 EXTRA_PORT=3001 bash start.sh" > "$OUT/$label.server.log" 2>&1 &
