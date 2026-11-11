@@ -24,19 +24,18 @@ env:
 
 jobs:
   variants:
-    name: "variants at ${{ matrix.conditions }} (${{ matrix.users }} users)"
+    name: "variants at ${{ matrix.conditions }} (loss ${{ matrix.dir }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         # Postgres link loss % : client link loss %; every variant runs each condition on the same runner
-        conditions: ["10:10 15:15", "20:20 15:0", "0:0 5:3"]
-        users: [16000]
+        conditions: ["10:10 15:15", "15:0 20:0"]
+        dir: [both, in]
         include:
-          # nearer a scoring loop's rate, as far as the runner's four cores carry Postgres and the load with it
-          - conditions: "0:0 10:10"
-            users: 28000
+          - conditions: "20:20 25:25"
+            dir: in
     services:
       postgres:
         image: postgres:18
@@ -79,14 +78,23 @@ jobs:
             bash lab/loss.sh "$1-pg${c%%:*}-cl${c##*:}" /tmp/v/$2 $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 ${4:-} || echo "$1 $c: run failed"
           }
           all="MU_GUARD=1 $nudge MU_STALL_MS=4"
-          USERS=${{ matrix.users }}
+          export LOSS_DIR=${{ matrix.dir }}
+          run() { # run <label> <build> <condition> [switches]
+            local c=$3
+            bash lab/loss.sh "$1-pg${c%%:*}-cl${c##*:}-$LOSS_DIR" /tmp/v/$2 $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 ${4:-} || echo "$1 $c: run failed"
+          }
+          first=1
           for c in ${{ matrix.conditions }}; do
+            if [ $first = 1 ]; then first=0; run wide64-quiet new 0:0 "$all MU_READERS=64"; fi
             run base base $c
-            run wide32 new $c "$all MU_READERS=32"
             run wide64 new $c "$all MU_READERS=64"
             run turns64 new $c "$all MU_READERS=64 MU_PICK=1"
-            run split64 new $c "$all MU_READERS=64 MU_MAX_BATCH=4"
+            run wide64z new $c "$all MU_READERS=64 MU_NUDGE_Z=1"
+            run turns64z new $c "$all MU_READERS=64 MU_PICK=1 MU_NUDGE_Z=1"
+            run turns110z new $c "$all MU_READERS=110 MU_PICK=1 MU_NUDGE_Z=1"
           done
+          grep -h '^stats' lab/out/*.server.log | tail -0 || true
+          for f in lab/out/*.server.log; do echo "$(basename "$f" .server.log) $(grep '^stats' "$f" | tail -1)"; done > lab/out/stats.txt || true
           { echo '```'; column -t -s $'\t' lab/out/loss.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -131,8 +139,9 @@ jobs:
         run: |
           mkdir -p lab/out && python3 lab/loss_summary.py header > lab/out/loss.tsv
           short=$(echo "${{ matrix.entry }}" | cut -d- -f1)
-          for c in 0:0 5:3 10:5 10:10 15:15; do
-            bash lab/loss.sh "$short-pg${c%%:*}-cl${c##*:}" submissions/${{ matrix.entry }} $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 || echo "$c: run failed"
+          export LOSS_DIR=in
+          for c in 5:5 10:10 15:15 20:20; do
+            bash lab/loss.sh "$short-pg${c%%:*}-cl${c##*:}-in" submissions/${{ matrix.entry }} $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 || echo "$c: run failed"
           done
           { echo '```'; column -t -s $'\t' lab/out/loss.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

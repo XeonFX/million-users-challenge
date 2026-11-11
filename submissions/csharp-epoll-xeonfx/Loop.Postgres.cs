@@ -300,13 +300,18 @@ sealed partial class Loop
             if (i >= _readers)
             {
                 while (!pg.Broken && pg.NextReply(out ReadOnlySpan<byte> reply, out bool group))
-                    if (group) OnWriteGroupReply(pg, reply);
+                    if (group)
+                    {
+                        if (Stats) Note(_writeWaits, _now - pg.GroupSent, pg.Group.Count);
+                        OnWriteGroupReply(pg, reply);
+                    }
                 continue;
             }
             while (!pg.Broken && pg.NextResult(out ReadOnlySpan<byte> result, out byte end))
             {
                 if (end == 'Z' || pg.Pending == 0) continue;
                 Waiter w = pg.TakeWaiter();
+                if (Stats) Note(_readWaits, _now - w.Sent);
                 if (end == 'E') RetryRestOfBatch(pg, w);
                 if (Conns[w.Fd].Gen != w.Gen) continue;
                 Conns[w.Fd].Busy = false;
@@ -385,6 +390,36 @@ sealed partial class Loop
             Console.Error.WriteLine("postgres: " + e.Message);
             pg.Close();
         }
+    }
+
+    // ---- lab: how long reads and writes waited for Postgres, and how many nudges went out
+
+    public static readonly bool Stats = Pg.Env("MU_STATS", 0) != 0;
+    static readonly int[] WaitEdgesMs = [5, 20, 50, 150, 300, 600, 1200];
+    readonly long[] _readWaits = new long[8], _writeWaits = new long[8];
+    long _statsAt;
+    static int _loops;
+    readonly int _id = System.Threading.Interlocked.Increment(ref _loops);
+
+    static void Note(long[] waits, long ticks, int n = 1)
+    {
+        long ms = ticks * 1000 / System.Diagnostics.Stopwatch.Frequency;
+        int b = 0;
+        while (b < WaitEdgesMs.Length && ms >= WaitEdgesMs[b]) b++;
+        waits[b] += n;
+    }
+
+    void PrintStats()
+    {
+        if (_now - _statsAt < 10 * System.Diagnostics.Stopwatch.Frequency) return;
+        _statsAt = _now;
+        long nudges = 0, busy = 0;
+        for (int i = 0; i < _pgs.Length; i++)
+        {
+            nudges += _pgs[i].NudgesSent;
+            if (_pgs[i].Owes) busy++;
+        }
+        Console.Error.WriteLine($"stats loop={_id} reads[<5,<20,<50,<150,<300,<600,<1200,more]={string.Join(',', _readWaits)} writes={string.Join(',', _writeWaits)} nudges={nudges} busy={busy}/{_pgs.Length}");
     }
 
     bool AnyBroken()

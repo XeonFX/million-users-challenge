@@ -62,7 +62,7 @@ count -i lo --dport 3000:3001                                  # 6 clients -> se
 sudo iptables -I INPUT -j MU_COUNT
 sudo iptables -I OUTPUT -o "$bridge" -j MU_COUNT
 
-sudo bash -c "ulimit -n 2000000; cd '$entry' && exec taskset -c $cpus env $extra DATABASE_URL=postgres://postgres:postgres@$pgip:5432/$DB \
+sudo bash -c "ulimit -n 2000000; cd '$entry' && exec taskset -c $cpus env MU_STATS=1 $extra DATABASE_URL=postgres://postgres:postgres@$pgip:5432/$DB \
   JWT_SECRET=million-users-challenge HOST=0.0.0.0 PORT=3000 EXTRA_PORT=3001 bash start.sh" > "$OUT/$label.server.log" 2>&1 &
 server=$!
 for _ in $(seq 60); do curl -sf http://127.0.0.1:3000/health >/dev/null && break; sleep 1; done
@@ -71,15 +71,18 @@ curl -sf http://127.0.0.1:3000/health >/dev/null || { echo "server didn't come u
 # the drops, once the server is up and logged in
 prob() { awk -v p="$1" 'BEGIN { printf "%.4f", p / 100 }'; }
 sudo iptables -N MU_LOSS; inpg iptables -N MU_LOSS
+# LOSS_DIR=in drops only what comes in to the server (Postgres's replies and the clients' packets), as a box whose
+# receive side is what overflows would; the default drops each way
+dir=${LOSS_DIR:-both}
 if [ "$pg_loss" != 0 ]; then
   p=$(prob "$pg_loss")
   sudo iptables -A MU_LOSS -p tcp -s "$pgip" --sport 5432 -m statistic --mode random --probability "$p" -j DROP
-  inpg iptables -A MU_LOSS -p tcp --dport 5432 -m statistic --mode random --probability "$p" -j DROP
+  [ "$dir" = in ] || inpg iptables -A MU_LOSS -p tcp --dport 5432 -m statistic --mode random --probability "$p" -j DROP
 fi
 if [ "$cl_loss" != 0 ]; then
   p=$(prob "$cl_loss")
   sudo iptables -A MU_LOSS -i lo -p tcp --dport 3000:3001 -m statistic --mode random --probability "$p" -j DROP
-  sudo iptables -A MU_LOSS -i lo -p tcp --sport 3000:3001 -m statistic --mode random --probability "$p" -j DROP
+  [ "$dir" = in ] || sudo iptables -A MU_LOSS -i lo -p tcp --sport 3000:3001 -m statistic --mode random --probability "$p" -j DROP
 fi
 # after the counters: INPUT is MU_COUNT, then MU_LOSS
 sudo iptables -I INPUT 2 -j MU_LOSS
@@ -95,6 +98,9 @@ sudo bash -c "ulimit -n 2000000; exec '$ROOT/bench/mload/mload' -target $targets
 counters=$(sudo iptables -L MU_COUNT -v -x -n | awk 'NR>2 {print $1, $2}')
 nstat -az > "$OUT/$label.nstat.app1" 2>/dev/null || true
 inpg nstat -az > "$OUT/$label.nstat.pg1" 2>/dev/null || true
+# each side's view of the Postgres connections as the run ends: congestion window, retransmit timer, retransmits
+ss -tin "dst $pgip" > "$OUT/$label.ss.app" 2>/dev/null || true
+inpg ss -tin > "$OUT/$label.ss.pg" 2>/dev/null || true
 # the CPU seconds of the server and whatever it forked
 cpu=$(ps -eo pid=,ppid=,cputimes= | awk -v root="$server" '{ pp[$1] = $2; t[$1] = $3 }
   END { for (p in pp) { q = p; while (q in pp && q != root && q != 1) q = pp[q]; if (q == root) s += t[p] } print s + 0 }')

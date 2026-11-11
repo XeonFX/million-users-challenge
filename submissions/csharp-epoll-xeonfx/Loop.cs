@@ -166,6 +166,7 @@ sealed unsafe partial class Loop
             else if (Environment.TickCount64 >= pg.RetryAt) Reconnect(i);
             broken |= pg.Broken;
         }
+        if (Stats) PrintStats();
         return WaitNanos(due, _now, broken);
     }
 

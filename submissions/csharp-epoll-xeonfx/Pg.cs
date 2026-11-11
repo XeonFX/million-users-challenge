@@ -26,6 +26,8 @@ struct Waiter
     public byte Kind;
     public bool Last;
     public long Id;
+    /// <summary>Lab: when its batch was sealed (a Stopwatch timestamp).</summary>
+    public long Sent;
 }
 
 /// <summary>A write waiting for its group's commit, with what its reply needs.</summary>
@@ -73,11 +75,23 @@ sealed class Pg
     public static readonly int StallAfterMs = Env("MU_STALL_MS", 0);
     /// <summary>Whether a batch or group is followed by a <see cref="Guard"/>.</summary>
     public static readonly bool Guarded = Env("MU_GUARD", 0) != 0;
+    /// <summary>Whether a connection is nudged for the ReadyForQuerys it is owed as well as for replies: a guard's or
+    /// a nudge's own answer that was lost leaves a packet unacknowledged at each end, and both ends' retransmit
+    /// timers then cut the connection's window to one packet, which makes its next exchange a single packet
+    /// again.</summary>
+    public static readonly bool NudgeForReady = Env("MU_NUDGE_Z", 0) != 0;
+    /// <summary>A reader's Syncs whose ReadyForQuery hasn't come back.</summary>
+    int _readyOwed;
+    /// <summary>Owes replies, or (<see cref="NudgeForReady"/>) the answer to a Sync.</summary>
+    bool Awaits => Owes || (NudgeForReady && (_writer ? _syncs.Count > 0 : _readyOwed > 0));
+
     /// <summary>1: a pass's reads go to the free reader that has waited longest for work, so the readers take turns
     /// (<see cref="Loop.LeastLoaded"/>). 0: to the first of them.</summary>
     public static readonly int Pick = Env("MU_PICK", 0);
     /// <summary>When the reader's last batch was sealed (a Stopwatch timestamp).</summary>
     public long LastUsed;
+    /// <summary>Lab: nudges sent on this connection, and when its group in flight was sent.</summary>
+    public long NudgesSent, GroupSent;
     /// <summary>How long a connect, and each answer of the login, may take.</summary>
     const int LoginTimeoutMs = 2_000;
     /// <summary>How long a dropped connection waits before it reconnects.</summary>
@@ -351,6 +365,7 @@ sealed class Pg
         _outLength = _outSent = _sealed = _inStart = _inEnd = 0;
         _guard = -1;
         Open = 0;
+        _readyOwed = 0;
         _syncs.Clear();
         _nudges = 0;
     }
@@ -395,8 +410,11 @@ sealed class Pg
     public void Seal(long now)
     {
         if (Open == 0) return;
-        if (!Owes) Await(now);
+        if (!Awaits) Await(now);
         LastUsed = now;
+        _readyOwed++;
+        if (Loop.Stats)
+            for (int k = 1; k <= Open; k++) _waiters[(_waiterHead + _waiterCount - k) % _waiters.Length].Sent = now;
         PutBytes(SyncMessage);
         _waiters[(_waiterHead + _waiterCount - 1) % _waiters.Length].Last = true;
         Open = 0;
@@ -420,6 +438,7 @@ sealed class Pg
         _guard = _outLength;
         PutBytes(SyncMessage);
         if (_writer) _syncs.Enqueue(false);
+        else _readyOwed++;
         _sealed = _outLength;
     }
 
@@ -445,12 +464,14 @@ sealed class Pg
     /// more away and doubling. Returns when the next nudge is due (long.MaxValue when nothing is owed).</summary>
     public long Nudge(long now)
     {
-        if (Broken || !Owes) return long.MaxValue;
+        if (Broken || !Awaits) return long.MaxValue;
         if (now < _nudgeDue) return _nudgeDue;
         PutBytes(SyncMessage);
         _sealed = _outLength;
         if (_writer) _syncs.Enqueue(false);
+        else _readyOwed++;
         _nudges++;
+        NudgesSent++;
         long interval = Ticks(_writer ? WriteNudgeAfterMs : ReadNudgeAfterMs);
         if (_nudges >= SteadyNudges) interval = Math.Min(interval << Math.Min(_nudges - SteadyNudges + 1, 16), Ticks(NudgeCapMs));
         return _nudgeDue = now + interval;
@@ -470,6 +491,7 @@ sealed class Pg
     public void SendGroup(long now)
     {
         Await(now);
+        GroupSent = now;
         _syncs.Enqueue(true);
         foreach (WriteJob job in Group)
         {
@@ -587,6 +609,7 @@ sealed class Pg
             return false;
         }
         result = _in.AsSpan(_inStart, n);
+        if (end == 'Z' && _readyOwed > 0) _readyOwed--;
         _inStart += n;
         if (_inStart == _inEnd) _inStart = _inEnd = 0;
         return true;
