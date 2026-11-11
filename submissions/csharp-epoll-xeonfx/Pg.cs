@@ -73,6 +73,11 @@ sealed class Pg
     public static readonly int StallAfterMs = Env("MU_STALL_MS", 0);
     /// <summary>Whether a batch or group is followed by a <see cref="Guard"/>.</summary>
     public static readonly bool Guarded = Env("MU_GUARD", 0) != 0;
+    /// <summary>1: a pass's reads go to the free reader that has waited longest for work, so the readers take turns
+    /// (<see cref="Loop.LeastLoaded"/>). 0: to the first of them.</summary>
+    public static readonly int Pick = Env("MU_PICK", 0);
+    /// <summary>When the reader's last batch was sealed (a Stopwatch timestamp).</summary>
+    public long LastUsed;
     /// <summary>How long a connect, and each answer of the login, may take.</summary>
     const int LoginTimeoutMs = 2_000;
     /// <summary>How long a dropped connection waits before it reconnects.</summary>
@@ -391,6 +396,7 @@ sealed class Pg
     {
         if (Open == 0) return;
         if (!Owes) Await(now);
+        LastUsed = now;
         PutBytes(SyncMessage);
         _waiters[(_waiterHead + _waiterCount - 1) % _waiters.Length].Last = true;
         Open = 0;

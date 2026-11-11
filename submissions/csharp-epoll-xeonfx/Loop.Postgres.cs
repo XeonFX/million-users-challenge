@@ -36,6 +36,16 @@ sealed partial class Loop
     internal static Pg? LeastLoaded(Pg[] pgs, int readers, long now)
     {
         Pg? best = null;
+        if (Pg.Pick == 1)
+        {
+            // the readers take turns: the free one that has waited longest
+            for (int i = 0; i < readers; i++)
+            {
+                Pg c = pgs[i];
+                if (!c.Broken && c.Pending == 0 && (best == null || c.LastUsed < best.LastUsed)) best = c;
+            }
+            if (best != null) return best;
+        }
         bool bestStalled = true;
         for (int i = 0; i < readers; i++)
         {
