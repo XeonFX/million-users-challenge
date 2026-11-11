@@ -113,4 +113,7 @@ jobs:
           { echo '```'; column -t -s $'\t' lab/out/loss.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: loss-${{ matrix.entry }}, path: lab/out, retention-days: 14 }
+        with:
+          name: loss-${{ matrix.entry }}
+          path: lab/out
+          retention-days: 14
