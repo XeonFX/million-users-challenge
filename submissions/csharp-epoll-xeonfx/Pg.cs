@@ -413,7 +413,7 @@ sealed class Pg
         if (!Awaits) Await(now);
         LastUsed = now;
         _readyOwed++;
-        if (Loop.Stats)
+        if (Loop.Stats || Loop.Adapt)
             for (int k = 1; k <= Open; k++) _waiters[(_waiterHead + _waiterCount - k) % _waiters.Length].Sent = now;
         PutBytes(SyncMessage);
         _waiters[(_waiterHead + _waiterCount - 1) % _waiters.Length].Last = true;
@@ -453,6 +453,10 @@ sealed class Pg
 
     /// <summary>Owes replies and has been silent for <see cref="StallAfterMs"/>: most likely a packet was lost, and
     /// what is queued behind it waits until it is resent.</summary>
+    /// <summary>How long the connection has been silent on what it owes, in Stopwatch ticks; 0 when it owes
+    /// nothing.</summary>
+    public long SilentFor(long now) => !Broken && Owes ? now - _heard : 0;
+
     public bool Stalled(long now) => StallAfterMs > 0 && !Broken && Owes && now - _heard > Ticks(StallAfterMs);
 
     /// <summary>Sends a lone Sync when the connection owes replies and has been silent for

@@ -31,11 +31,11 @@ jobs:
       fail-fast: false
       matrix:
         # Postgres link loss % : client link loss %; every variant runs each condition on the same runner
-        conditions: ["10:10 15:15", "15:0 20:0"]
-        dir: [both, in]
         include:
-          - conditions: "20:20 25:25"
-            dir: in
+          - { conditions: "15:15 20:20", dir: in }
+          - { conditions: "18:18 10:10", dir: in }
+          - { conditions: "10:10 12:12", dir: both }
+          - { conditions: "15:15 5:5", dir: both }
     services:
       postgres:
         image: postgres:18
@@ -83,15 +83,15 @@ jobs:
             local c=$3
             bash lab/loss.sh "$1-pg${c%%:*}-cl${c##*:}-$LOSS_DIR" /tmp/v/$2 $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 ${4:-} || echo "$1 $c: run failed"
           }
+          wide="$all MU_READERS=110 MU_WRITERS=8"
           first=1
           for c in ${{ matrix.conditions }}; do
-            if [ $first = 1 ]; then first=0; run wide64-quiet new 0:0 "$all MU_READERS=64"; fi
-            run base base $c
-            run wide64 new $c "$all MU_READERS=64"
-            run turns64 new $c "$all MU_READERS=64 MU_PICK=1"
-            run wide64z new $c "$all MU_READERS=64 MU_NUDGE_Z=1"
-            run turns64z new $c "$all MU_READERS=64 MU_PICK=1 MU_NUDGE_Z=1"
-            run turns110z new $c "$all MU_READERS=110 MU_PICK=1 MU_NUDGE_Z=1"
+            if [ $first = 1 ]; then first=0; run quiet-hot110a new 0:0 "$wide MU_PICK=2 MU_ADAPT=1"; fi
+            run turns110 new $c "$wide MU_PICK=1"
+            run hot110 new $c "$wide MU_PICK=2"
+            run hot110a new $c "$wide MU_PICK=2 MU_ADAPT=1"
+            run turns110a new $c "$wide MU_PICK=1 MU_ADAPT=1"
+            run hot110cap4 new $c "$wide MU_PICK=2 MU_MAX_BATCH=4"
           done
           grep -h '^stats' lab/out/*.server.log | tail -0 || true
           for f in lab/out/*.server.log; do echo "$(basename "$f" .server.log) $(grep '^stats' "$f" | tail -1)"; done > lab/out/stats.txt || true
@@ -105,6 +105,7 @@ jobs:
 
   rivals:
     name: ${{ matrix.entry }}
+    if: ${{ false }}   # measured in earlier rounds
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     strategy:
