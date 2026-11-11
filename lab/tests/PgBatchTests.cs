@@ -85,7 +85,8 @@ public sealed class PgBatchTests
 
         pg.Seal(T);
         var sent = Messages(pg.Unsent);
-        Assert.Equal("BEBEBES", new string(sent.Select(m => m.Type).ToArray()));
+        // the batch's Sync, and one more behind it that guards it
+        Assert.Equal("BEBEBESS", new string(sent.Select(m => m.Type).ToArray()));
         Assert.Equal(0, pg.Open);
         Assert.True(pg.WantsWrite);
         // no Describe: the rows come back without a RowDescription
@@ -128,7 +129,7 @@ public sealed class PgBatchTests
         pg.Read(Pg.Feed, 0, 2, 1);
         pg.Read(Pg.Feed, 0, 3, 1);
         pg.Seal(T);
-        Assert.Equal("BESBEBES", new string(Messages(pg.Unsent).Select(m => m.Type).ToArray()));
+        Assert.Equal("BESSBEBESS", new string(Messages(pg.Unsent).Select(m => m.Type).ToArray()));
         Assert.True(pg.Owes);
         Assert.Equal([true, false, true], new[] { pg.TakeWaiter(), pg.TakeWaiter(), pg.TakeWaiter() }.Select(w => w.Last));
     }

@@ -1,6 +1,7 @@
-# The csharp-epoll-xeonfx loss lab, on this fork only: load runs with packets dropped on the Postgres link and on the
-# client link, as the scoring box's network drops them near its limit, for the scored version, this branch's, and the
-# entries ranked above it. Free GitHub-hosted runners; nothing here goes to the challenge.
+# The csharp-epoll-xeonfx loss lab, on this fork only: the entry's own tests on Linux, and load runs with packets
+# dropped on the Postgres link and on the client link, as the scoring box's network drops them near its limit, for the
+# scored version, this branch's, and the entries ranked above it. Free GitHub-hosted runners; nothing here goes to the
+# challenge.
 name: xeonfx loss lab
 on:
   push:
@@ -17,25 +18,58 @@ env:
   ENTRY: submissions/csharp-epoll-xeonfx
   # the scored version: #114
   BASE: 0bc30c2
-  # one loop (as a 4-core box gives each of its loops: 8 readers, 4 writers) at about half a scoring loop's rate
+  # one loop at about half a scoring loop's rate
   USERS: 16000
   THINK: 0.25
   HOLD: 60
 
 jobs:
-  variants:
-    name: "variants at ${{ matrix.conditions }} (loss ${{ matrix.dir }})"
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: tools and Postgres as the challenge's CI sets it up
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl openssl
+          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$(docker ps -q --filter ancestor=postgres:18)"
+          until pg_isready -q; do sleep 1; done
+      - run: bash seed/make-seed.sh
+      - run: sudo bash $ENTRY/install.sh > /dev/null
+      - name: the challenge's checks (test/run.sh)
+        run: bash test/run.sh $ENTRY
+      - name: the entry's own tests, the server ones included
+        run: |
+          bash $ENTRY/build.sh
+          psql -qX -d postgres -c "DROP DATABASE IF EXISTS mu_test WITH (FORCE)" -c "CREATE DATABASE mu_test TEMPLATE feed_seed"
+          export MILLION_USERS_ENTRY=$PWD/$ENTRY
+          export MU_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/mu_test
+          export MU_ADMIN_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres
+          cd lab/tests
+          dotnet build -c Release -v q -nologo
+          dotnet bin/Release/net10.0/Verification.dll -maxThreads 2
+
+  loss:
+    name: "${{ matrix.conditions }} (loss ${{ matrix.dir }}, cpus ${{ matrix.cpus }}, think ${{ matrix.think }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        # Postgres link loss % : client link loss %; every variant runs each condition on the same runner
         include:
-          - { conditions: "15:15 20:20", dir: in }
-          - { conditions: "18:18 10:10", dir: in }
-          - { conditions: "10:10 12:12", dir: both }
-          - { conditions: "15:15 5:5", dir: both }
+          # Postgres link loss % : client link loss %. "in" drops only what comes in to the server.
+          - { conditions: "0:0 5:5 10:10 15:15 18:18 20:20", dir: in, cpus: "0", think: "0.25", users: 16000 }
+          - { conditions: "5:5 10:10 12:12 15:15 10:0 15:0", dir: both, cpus: "0", think: "0.25", users: 16000 }
+          # every loop the runner's four cores give, and the scoring run's think time (keep-alives and all)
+          - { conditions: "0:0 10:10 15:15", dir: in, cpus: "0-3", think: "0.25", users: 16000 }
+          - { conditions: "0:0", dir: in, cpus: "0", think: "2.5", users: 40000 }
     services:
       postgres:
         image: postgres:18
@@ -67,39 +101,20 @@ jobs:
           git archive "$BASE" $ENTRY | tar -x -C /tmp/v && mv /tmp/v/$ENTRY /tmp/v/base && rm -rf /tmp/v/submissions
           cp -r $ENTRY /tmp/v/new
           for b in base new; do bash /tmp/v/$b/build.sh > /dev/null; done
-      - name: the challenge's checks on this branch's entry
-        run: bash test/run.sh $ENTRY
       - name: runs
         run: |
           mkdir -p lab/out && python3 lab/loss_summary.py header > lab/out/loss.tsv
-          nudge="MU_READ_NUDGE_MS=5 MU_WRITE_NUDGE_MS=20 MU_STEADY_NUDGES=4 MU_NUDGE_CAP_MS=80"
-          run() { # run <label> <build> <condition> [switches]
-            local c=$3
-            bash lab/loss.sh "$1-pg${c%%:*}-cl${c##*:}" /tmp/v/$2 $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 ${4:-} || echo "$1 $c: run failed"
-          }
-          all="MU_GUARD=1 $nudge MU_STALL_MS=4"
           export LOSS_DIR=${{ matrix.dir }}
-          run() { # run <label> <build> <condition> [switches]
-            local c=$3
-            bash lab/loss.sh "$1-pg${c%%:*}-cl${c##*:}-$LOSS_DIR" /tmp/v/$2 $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 ${4:-} || echo "$1 $c: run failed"
-          }
-          wide="$all MU_READERS=110 MU_WRITERS=8"
-          first=1
           for c in ${{ matrix.conditions }}; do
-            if [ $first = 1 ]; then first=0; run quiet-hot110a new 0:0 "$wide MU_PICK=2 MU_ADAPT=1"; fi
-            run turns110 new $c "$wide MU_PICK=1"
-            run hot110 new $c "$wide MU_PICK=2"
-            run hot110a new $c "$wide MU_PICK=2 MU_ADAPT=1"
-            run turns110a new $c "$wide MU_PICK=1 MU_ADAPT=1"
-            run hot110cap4 new $c "$wide MU_PICK=2 MU_MAX_BATCH=4"
+            for b in base new; do
+              bash lab/loss.sh "$b-pg${c%%:*}-cl${c##*:}-$LOSS_DIR" /tmp/v/$b ${{ matrix.users }} ${{ matrix.think }} $HOLD "${c%%:*}" "${c##*:}" ${{ matrix.cpus }} || echo "$b $c: run failed"
+            done
           done
-          grep -h '^stats' lab/out/*.server.log | tail -0 || true
-          for f in lab/out/*.server.log; do echo "$(basename "$f" .server.log) $(grep '^stats' "$f" | tail -1)"; done > lab/out/stats.txt || true
           { echo '```'; column -t -s $'\t' lab/out/loss.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: loss-variants-${{ strategy.job-index }}
+          name: loss-${{ strategy.job-index }}
           path: lab/out
           retention-days: 14
 

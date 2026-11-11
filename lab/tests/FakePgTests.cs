@@ -315,14 +315,21 @@ public sealed class FakePgTests : IDisposable
 
     static int Count(string log, char c) => log.Count(x => x == c);
 
+    /// <summary>The batches and groups in a log: each run of statements with the Sync that ends it. The Syncs behind
+    /// it (its guard, then nudges while the fake holds its answer) aren't batches.</summary>
+    static string[] Batches(string log) => [.. System.Text.RegularExpressions.Regex.Matches(log, "[a-z]+S").Select(m => m.Value[..^1])];
+
+    /// <summary>The server's connections in one loop: 456 readers and 8 writers.</summary>
+    const int Connections = 464;
+
     [Fact]
-    public void TheServerRunsOneLoopWithEightReadersAndFourWriters()
+    public void TheServerRunsOneLoopWithMostOfPostgresConnections()
     {
         Connect();
         var until = Stopwatch.StartNew();
-        while (_pg.Conns.Count < 12 && until.ElapsedMilliseconds < 3000) Thread.Sleep(10);
-        Thread.Sleep(100); // and no more than that
-        Assert.Equal(12, _pg.Conns.Count);
+        while (_pg.Conns.Count < Connections && until.ElapsedMilliseconds < 15_000) Thread.Sleep(10);
+        Thread.Sleep(200); // and no more than that
+        Assert.Equal(Connections, _pg.Conns.Count);
     }
 
     [Fact]
@@ -336,9 +343,11 @@ public sealed class FakePgTests : IDisposable
         _pg.WaitFor(_ => _pg.Conns.Sum(c => Count(c.Log, 'p')) == 41, what: "all 41 reads");
 
         string[] logs = [.. _pg.Conns.Select(c => c.Log).Where(l => l.Length > 0)];
-        // one Sync a pass and connection, not one a read: a few passes at most took them
-        Assert.InRange(logs.Sum(l => Count(l, 'S')), 1, 4);
-        Assert.All(logs, l => Assert.EndsWith("S", l, StringComparison.Ordinal));
+        // one batch a pass, not one a read: a few passes at most took them, each on a reader of its own
+        Assert.InRange(logs.Sum(l => Batches(l).Length), 1, 4);
+        Assert.All(logs, l => Assert.Single(Batches(l)));
+        // and behind each batch's Sync comes its guard
+        Assert.All(logs, l => Assert.StartsWith(Batches(l)[0] + "SS", l, StringComparison.Ordinal));
         Assert.Contains(logs, l => l.Contains("pppppppppp", StringComparison.Ordinal));
 
         foreach (FakeConn c in _pg.Conns) c.Answer(int.MaxValue);
@@ -365,11 +374,28 @@ public sealed class FakePgTests : IDisposable
     }
 
     [Fact]
-    public void AReaderThatStaysSilentIsNudgedAndNewReadsGoToAnother()
+    public void ReadsOneAfterAnotherTakeTurnsOverTheReadersEachBatchWithItsGuard()
+    {
+        Client client = Connect();
+        Assert.Equal(200, client.Get("/health").Status);
+        Thread.Sleep(20);
+        _pg.Clear();
+        for (int i = 1; i <= 5; i++)
+        {
+            client.Send(Client.Request("GET", "/posts/" + i));
+            Assert.Equal(i, client.Read().Json.GetProperty("post").GetProperty("id").GetInt64());
+            Thread.Sleep(5); // the reader is free again; the next read still goes to one that has waited longer
+        }
+        string[] logs = [.. _pg.Conns.Select(c => c.Log).Where(l => l.Length > 0)];
+        Assert.Equal(["pSS", "pSS", "pSS", "pSS", "pSS"], logs);
+    }
+
+    [Fact]
+    public void AReaderThatStaysSilentIsNudgedEvery5MsThenLessOftenAndNewReadsGoToAnother()
     {
         Client[] clients = HeldClients(3);
         clients[0].Send(Client.Request("GET", "/posts/11"));
-        FakeConn silent = _pg.WaitFor(l => l == "pS", what: "the first read");
+        FakeConn silent = _pg.WaitFor(l => l.StartsWith("pS", StringComparison.Ordinal), what: "the first read");
 
         // a read that comes while the first reader owes its reply goes to another reader
         Thread.Sleep(10);
@@ -379,23 +405,52 @@ public sealed class FakePgTests : IDisposable
         Assert.Equal(1, other.Answer());
         Assert.Equal(22, clients[1].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
 
-        // 50 ms of silence, then a lone Sync; 100 ms more, then another
-        _pg.WaitFor(_ => silent.Log == "pSS", 1000, "the first nudge");
-        double first = silent.TimeOf(2) - silent.TimeOf(1);
-        Assert.InRange(first, 45, 150);
-        _pg.WaitFor(_ => silent.Log == "pSSS", 1000, "the second nudge");
-        double second = silent.TimeOf(3) - silent.TimeOf(2);
-        Assert.InRange(second, 95, 250);
+        // the batch's Sync and its guard at once; after 5 ms of silence a lone Sync, and another 5 ms later
+        _pg.WaitFor(_ => silent.Log.Length >= 5, 1000, "two nudges");
+        Assert.StartsWith("pSSSS", silent.Log, StringComparison.Ordinal);
+        Assert.InRange(silent.TimeOf(2) - silent.TimeOf(1), 0, 3); // the guard, right behind
+        Assert.InRange(silent.TimeOf(3) - silent.TimeOf(1), 4, 60);
+        Assert.InRange(silent.TimeOf(4) - silent.TimeOf(3), 3, 60);
+        // then they back off to one every 80 ms: about ten in the first 400 ms, where one every 5 ms would be 80
+        Thread.Sleep(400);
+        Assert.InRange(Count(silent.Log, 'S') - 2, 6, 20);
         Assert.False(clients[0].Hears(0));
 
-        // the reply and the nudges' ReadyForQuerys arrive: the read is answered, once, and the reader works on
-        Assert.Equal(3, silent.Answer(3));
+        // the reply and every other ReadyForQuery arrive: the read is answered, once, and the reader works on
+        Assert.InRange(silent.Answer(int.MaxValue), 8, 30);
         Assert.Equal(11, clients[0].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
         Assert.False(clients[0].Hears(50));
         _pg.Clear();
         clients[2].Send(Client.Request("GET", "/posts/33"));
-        _pg.WaitFor(l => l == "pS").Answer();
+        _pg.WaitFor(l => l.StartsWith("pS", StringComparison.Ordinal)).Answer();
         Assert.Equal(33, clients[2].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
+    }
+
+    [Fact]
+    public void WhileReadsWaitThroughRetransmitTimersNewBatchesAreSmallerAndOnMoreReaders()
+    {
+        Client[] clients = HeldClients(150);
+        // 110 reads whose answers don't come: after 350 ms they count as waiting through timers, and each quarter of
+        // a second from then the batch size halves
+        for (int i = 0; i < 110; i++) clients[i].Send(Client.Request("GET", "/posts/" + (i + 1)));
+        _pg.WaitFor(_ => _pg.Conns.Sum(c => Count(c.Log, 'p')) == 110, what: "the 110 reads");
+        Assert.All(_pg.Conns, c => Assert.All(Batches(c.Log), batch => Assert.InRange(batch.Length, 1, 64)));
+        Assert.Contains(_pg.Conns, c => Batches(c.Log).Any(batch => batch.Length > 16));
+        Thread.Sleep(1300);
+
+        _pg.Clear();
+        for (int i = 110; i < 150; i++) clients[i].Send(Client.Request("GET", "/posts/" + (i + 1)));
+        _pg.WaitFor(_ => _pg.Conns.Sum(c => Count(c.Log, 'p')) == 40, what: "the 40 reads after");
+        string[][] after = [.. _pg.Conns.Select(c => Batches(c.Log)).Where(b => b.Length > 0)];
+        // 64 at first; halved at least twice by now, so 40 reads no longer fit one or two batches
+        Assert.All(after, batches => Assert.All(batches, batch => Assert.InRange(batch.Length, 1, 16)));
+        Assert.True(after.Length >= 3, $"{after.Length} readers took the 40 reads");
+        // each on a reader with nothing else waiting: none behind the stalled ones
+        Assert.All(after, batches => Assert.Single(batches));
+
+        foreach (FakeConn c in _pg.Conns) c.Answer(int.MaxValue);
+        for (int i = 110; i < 150; i++)
+            Assert.Equal(i + 1, clients[i].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
     }
 
     [Fact]
@@ -403,11 +458,11 @@ public sealed class FakePgTests : IDisposable
     {
         Client[] clients = HeldClients(3);
         clients[0].Send(Like(1));
-        FakeConn slow = _pg.WaitFor(l => l == "lS", what: "the first like");
+        FakeConn slow = _pg.WaitFor(l => l.StartsWith("lS", StringComparison.Ordinal), what: "the first like");
         Thread.Sleep(10);
         clients[1].Send(Like(2));
-        _pg.WaitFor(_ => _pg.Conns.Count(c => c.Log == "lS") == 2, what: "the second like on another writer");
-        FakeConn quick = _pg.Conns.First(c => c.Log == "lS" && !ReferenceEquals(c, slow));
+        _pg.WaitFor(_ => _pg.Conns.Count(c => c.Log.StartsWith("lS", StringComparison.Ordinal)) == 2, what: "the second like on another writer");
+        FakeConn quick = _pg.Conns.First(c => c.Log.StartsWith("lS", StringComparison.Ordinal) && !ReferenceEquals(c, slow));
 
         // the second writer's commit comes back first: its like is answered while the first still waits
         Assert.Equal(1, quick.Answer());
@@ -421,22 +476,28 @@ public sealed class FakePgTests : IDisposable
     }
 
     [Fact]
-    public void ANudgesAnswerIsNotTakenForTheNextGroupsCommit()
+    public void AGuardsAndANudgesAnswerAreNotTakenForTheNextGroupsCommit()
     {
         Client[] clients = HeldClients(2);
         clients[0].Send(Like(1));
-        FakeConn writer = _pg.WaitFor(l => l == "lS", what: "the like");
-        _pg.WaitFor(_ => writer.Log == "lSS", 1000, "the nudge");
+        FakeConn writer = _pg.WaitFor(l => l.StartsWith("lS", StringComparison.Ordinal), what: "the like");
+        // its Sync, its guard, and after 20 ms of silence a nudge
+        _pg.WaitFor(_ => writer.Log.StartsWith("lSSS", StringComparison.Ordinal), 1000, "the nudge");
+        Assert.InRange(writer.TimeOf(3) - writer.TimeOf(1), 15, 120);
 
-        // the commit's answer arrives, the nudge's doesn't yet
+        // the commit's answer arrives; the guard's and the nudge's don't yet
         Assert.Equal(1, writer.Answer());
         Assert.Equal(201, clients[0].Read().Status);
+        Thread.Sleep(30);
+        int stale = writer.Log.Length - 2; // every Sync but the group's own; no more come once nothing is owed
+        Thread.Sleep(60);
+        Assert.Equal(stale, writer.Log.Length - 2);
 
-        // the next group goes out on the same writer (the first with nothing out), behind the unanswered nudge
+        // the next group goes out on the same writer (the first with nothing out), behind the unanswered Syncs
         clients[1].Send(Like(2));
-        _pg.WaitFor(_ => writer.Log == "lSSlS", 1000, "the second like on the same writer");
-        // now the nudge's ReadyForQuery: it commits nothing, so the second like must keep waiting
-        Assert.Equal(1, writer.Answer());
+        _pg.WaitFor(_ => Count(writer.Log, 'l') == 2 && writer.Log.EndsWith("lSS", StringComparison.Ordinal), 1000, "the second like on the same writer");
+        // now the stale ReadyForQuerys: they commit nothing, so the second like must keep waiting
+        Assert.Equal(stale, writer.Answer(stale));
         Assert.False(clients[1].Hears(100));
         // and its own commit answers it
         Assert.Equal(1, writer.Answer());
@@ -448,24 +509,24 @@ public sealed class FakePgTests : IDisposable
     [Fact]
     public void WhenEveryWriterWaitsForItsCommitTheNextWritesQueueAndLeaveAsOneGroup()
     {
-        Client[] clients = HeldClients(10);
-        for (int i = 0; i < 4; i++)
+        Client[] clients = HeldClients(14);
+        for (int i = 0; i < 8; i++)
         {
             clients[i].Send(Like(i + 1));
-            _pg.WaitFor(_ => _pg.Conns.Count(c => c.Log == "lS") == i + 1, what: $"like {i + 1} on its own writer");
+            _pg.WaitFor(_ => _pg.Conns.Count(c => c.Log.StartsWith("lS", StringComparison.Ordinal)) == i + 1, what: $"like {i + 1} on its own writer");
         }
-        // all four writers have a group out: six more likes wait in the loop
-        for (int i = 4; i < 10; i++) clients[i].Send(Like(i + 1));
+        // all eight writers have a group out: six more likes wait in the loop
+        for (int i = 8; i < 14; i++) clients[i].Send(Like(i + 1));
         Thread.Sleep(30);
-        Assert.Equal(4, _pg.Conns.Sum(c => Count(c.Log, 'l')));
+        Assert.Equal(8, _pg.Conns.Sum(c => Count(c.Log, 'l')));
 
         // one commit comes back: the six leave together on that writer, one transaction
-        FakeConn first = _pg.Conns.First(c => c.Log == "lS");
+        FakeConn first = _pg.Conns.First(c => c.Log.StartsWith("lS", StringComparison.Ordinal));
         Assert.Equal(1, first.Answer());
-        _pg.WaitFor(_ => first.Log == "lSllllllS", 1000, "the six queued likes as one group");
-        Assert.Equal(1, first.Answer());
+        _pg.WaitFor(_ => Batches(first.Log).Length == 2, 1000, "the six queued likes as one group");
+        Assert.Equal(["l", "llllll"], Batches(first.Log));
         foreach (FakeConn c in _pg.Conns) c.Answer(int.MaxValue);
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < 14; i++)
         {
             Response r = clients[i].Read();
             Assert.Equal(201, r.Status);
@@ -478,9 +539,9 @@ public sealed class FakePgTests : IDisposable
     {
         Client[] clients = HeldClients(2);
         clients[0].Send(Like(1));
-        FakeConn writer = _pg.WaitFor(l => l == "lS", what: "the like");
+        FakeConn writer = _pg.WaitFor(l => l.StartsWith("lS", StringComparison.Ordinal), what: "the like");
         clients[1].Send(Client.Request("GET", "/posts/5"));
-        FakeConn reader = _pg.WaitFor(l => l == "pS", what: "the read");
+        FakeConn reader = _pg.WaitFor(l => l.StartsWith("pS", StringComparison.Ordinal), what: "the read");
         Assert.NotSame(writer, reader);
         Assert.Equal(1, reader.Answer());
         Assert.Equal(5, clients[1].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
@@ -494,11 +555,11 @@ public sealed class FakePgTests : IDisposable
     {
         Client[] clients = HeldClients(3);
         clients[0].Send(Like(1));
-        FakeConn doomed = _pg.WaitFor(l => l == "lS", what: "the first like");
+        FakeConn doomed = _pg.WaitFor(l => l.StartsWith("lS", StringComparison.Ordinal), what: "the first like");
         Thread.Sleep(10);
         clients[1].Send(Like(2));
-        _pg.WaitFor(_ => _pg.Conns.Count(c => c.Log == "lS") == 2, what: "the second like on another writer");
-        FakeConn other = _pg.Conns.First(c => c.Log == "lS" && !ReferenceEquals(c, doomed));
+        _pg.WaitFor(_ => _pg.Conns.Count(c => c.Log.StartsWith("lS", StringComparison.Ordinal)) == 2, what: "the second like on another writer");
+        FakeConn other = _pg.Conns.First(c => c.Log.StartsWith("lS", StringComparison.Ordinal) && !ReferenceEquals(c, doomed));
 
         doomed.Close();
         Assert.Equal(500, clients[0].Read().Status);
@@ -511,7 +572,7 @@ public sealed class FakePgTests : IDisposable
         clients[2].Send(Like(3));
         Assert.Equal(201, clients[2].Read().Status);
         var until = Stopwatch.StartNew();
-        while (_pg.Conns.Count < 13 && until.ElapsedMilliseconds < 5000) Thread.Sleep(20);
-        Assert.Equal(13, _pg.Conns.Count);
+        while (_pg.Conns.Count < Connections + 1 && until.ElapsedMilliseconds < 5000) Thread.Sleep(20);
+        Assert.Equal(Connections + 1, _pg.Conns.Count);
     }
 }
