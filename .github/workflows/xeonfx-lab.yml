@@ -1,0 +1,99 @@
+# The csharp-epoll-xeonfx lab, on this fork only: the entry's own tests on Linux against Postgres 18, the challenge's
+# checks, and load runs that count Postgres's bytes and the server's ACKs per request for the scored versions and this
+# branch's. Free GitHub-hosted runners; nothing here goes to the challenge.
+name: xeonfx lab
+on:
+  push:
+    branches: [test/xeonfx-lab]
+  workflow_dispatch:
+    inputs:
+      users: { description: "users per load run", default: "40000" }
+      think: { description: "mload -think-scale", default: "1" }
+      hold: { description: "hold seconds", default: "120" }
+permissions:
+  contents: read
+
+env:
+  PGHOST: 127.0.0.1
+  PGPORT: 5432
+  PGUSER: postgres
+  PGPASSWORD: postgres
+  ENTRY: submissions/csharp-epoll-xeonfx
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: tools and Postgres as the challenge's CI sets it up
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl openssl
+          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$(docker ps -q --filter ancestor=postgres:18)"
+          until pg_isready -q; do sleep 1; done
+      - run: bash seed/make-seed.sh
+      - run: sudo bash $ENTRY/install.sh > /dev/null
+      - name: the challenge's checks (test/run.sh)
+        run: bash test/run.sh $ENTRY
+      - name: the entry's own tests, the server ones included
+        run: |
+          bash $ENTRY/build.sh
+          psql -qX -d postgres -c "DROP DATABASE IF EXISTS mu_test WITH (FORCE)" -c "CREATE DATABASE mu_test TEMPLATE feed_seed"
+          export MILLION_USERS_ENTRY=$PWD/$ENTRY
+          export MU_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/mu_test
+          export MU_ADMIN_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres
+          cd lab/tests
+          dotnet build -c Release -v q -nologo
+          dotnet bin/Release/net10.0/Verification.dll -maxThreads 2
+
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: bench/mload/go.mod, cache: false }
+      - name: tools, Postgres and the box's kernel settings
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl iptables iproute2
+          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$(docker ps -q --filter ancestor=postgres:18)"
+          until pg_isready -q; do sleep 1; done
+          sudo bash box/setup-app-box.sh
+          sudo sysctl -q -w net.ipv4.ip_local_port_range="1024 65535"
+          cd bench/mload && go build -o mload .
+      - run: bash seed/make-seed.sh
+      - run: sudo bash $ENTRY/install.sh > /dev/null
+      - name: the three versions side by side
+        run: |
+          # #77 (1,390,000 on 4 cores), #111 (1,360,000), and this branch
+          mkdir -p /tmp/v
+          for v in a5cc758:p77 7cae48c:p111; do
+            git archive "${v%%:*}" $ENTRY | tar -x -C /tmp/v && mv /tmp/v/$ENTRY /tmp/v/${v##*:} && rm -rf /tmp/v/submissions
+          done
+          cp -r $ENTRY /tmp/v/new
+          for b in p77 p111 new; do bash /tmp/v/$b/build.sh > /dev/null; done
+          printf 'label\treqs\treq/s\tp50\tp95\tp99\terr%%\tpg_in_B\tpg_out_B\tresp_B\tsrv_acks\tclient_B\tdelacks\tdefer_drops\n' > lab/out.tsv
+          users=${{ inputs.users || '40000' }} think=${{ inputs.think || '1' }} hold=${{ inputs.hold || '120' }}
+          for round in 1 2; do
+            for b in p77 p111 new; do bash lab/measure.sh "$b-r$round" /tmp/v/$b $users $think $hold; done
+          done
+          cat lab/out/summary.tsv >> lab/out.tsv
+          { echo '```'; column -t -s $'\t' lab/out.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: lab-out, path: lab/out, retention-days: 14 }

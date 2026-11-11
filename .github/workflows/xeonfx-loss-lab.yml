@@ -1,0 +1,116 @@
+# The csharp-epoll-xeonfx loss lab, on this fork only: load runs with packets dropped on the Postgres link and on the
+# client link, as the scoring box's network drops them near its limit, for the scored version, this branch's, and the
+# entries ranked above it. Free GitHub-hosted runners; nothing here goes to the challenge.
+name: xeonfx loss lab
+on:
+  push:
+    branches: [test/xeonfx-loss-lab]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+env:
+  PGHOST: 127.0.0.1
+  PGPORT: 5432
+  PGUSER: postgres
+  PGPASSWORD: postgres
+  ENTRY: submissions/csharp-epoll-xeonfx
+  # the scored version: #114
+  BASE: 0bc30c2
+  # one loop (as a 4-core box gives each of its loops: 8 readers, 4 writers) at about half a scoring loop's rate
+  USERS: 16000
+  THINK: 0.25
+  HOLD: 60
+  # Postgres link loss % : client link loss %
+  CONDITIONS: "0:0 1:0 3:0 6:0 10:0 0:3 3:3"
+
+jobs:
+  pair:
+    name: scored version against this branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: bench/mload/go.mod, cache: false }
+      - name: tools, Postgres and the box's kernel settings
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl iptables iproute2 util-linux
+          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$(docker ps -q --filter ancestor=postgres:18)"
+          until pg_isready -q; do sleep 1; done
+          sudo bash box/setup-app-box.sh
+          sudo sysctl -q -w net.ipv4.ip_local_port_range="1024 65535"
+          cd bench/mload && go build -o mload .
+          uname -r; nproc; grep -m1 'model name' /proc/cpuinfo
+      - run: bash seed/make-seed.sh
+      - run: sudo bash $ENTRY/install.sh > /dev/null
+      - name: build both
+        run: |
+          mkdir -p /tmp/v
+          git archive "$BASE" $ENTRY | tar -x -C /tmp/v && mv /tmp/v/$ENTRY /tmp/v/base && rm -rf /tmp/v/submissions
+          cp -r $ENTRY /tmp/v/new
+          for b in base new; do bash /tmp/v/$b/build.sh > /dev/null; done
+      - name: the challenge's checks on this branch's entry
+        run: bash test/run.sh $ENTRY
+      - name: runs
+        run: |
+          mkdir -p lab/out && python3 lab/loss_summary.py header > lab/out/loss.tsv
+          for c in $CONDITIONS; do
+            for b in base new; do
+              bash lab/loss.sh "$b-pg${c%%:*}-cl${c##*:}" /tmp/v/$b $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 || echo "$b $c: run failed"
+            done
+          done
+          { echo '```'; column -t -s $'\t' lab/out/loss.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: loss-pair, path: lab/out, retention-days: 14 }
+
+  rivals:
+    name: ${{ matrix.entry }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: [c-epoll-unorig-username, fsharp-kestrel-uring-delneg]
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: bench/mload/go.mod, cache: false }
+      - name: tools, Postgres and the box's kernel settings
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl iptables iproute2 util-linux
+          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$(docker ps -q --filter ancestor=postgres:18)"
+          until pg_isready -q; do sleep 1; done
+          sudo bash box/setup-app-box.sh
+          sudo sysctl -q -w net.ipv4.ip_local_port_range="1024 65535"
+          cd bench/mload && go build -o mload .
+      - run: bash seed/make-seed.sh
+      - run: sudo bash submissions/${{ matrix.entry }}/install.sh > /dev/null
+      - run: bash submissions/${{ matrix.entry }}/build.sh > /dev/null
+      - name: runs
+        run: |
+          mkdir -p lab/out && python3 lab/loss_summary.py header > lab/out/loss.tsv
+          short=$(echo "${{ matrix.entry }}" | cut -d- -f1)
+          for c in $CONDITIONS; do
+            bash lab/loss.sh "$short-pg${c%%:*}-cl${c##*:}" submissions/${{ matrix.entry }} $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 || echo "$c: run failed"
+          done
+          { echo '```'; column -t -s $'\t' lab/out/loss.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: loss-${{ matrix.entry }}, path: lab/out, retention-days: 14 }
