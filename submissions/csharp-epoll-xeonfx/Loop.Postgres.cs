@@ -17,7 +17,7 @@ sealed partial class Loop
         if (pg == null || pg.Broken || pg.Open >= Pg.MaxBatch)
         {
             if (pg != null && !pg.Broken) pg.Seal(_now);
-            pg = _passReader = LeastLoaded(_pgs, _readers);
+            pg = _passReader = LeastLoaded(_pgs, _readers, _now);
             if (pg == null)
             {
                 if (statement == Pg.Health) Unhealthy(fd, "database connection is down"u8);
@@ -30,15 +30,23 @@ sealed partial class Loop
     }
 
     /// <summary>The reader with the fewest reads waiting, the first of them: while the first readers keep up they
-    /// carry every pass, so their packets follow each other closely (a lost one is noticed by the next) and the
-    /// others stay free for a pass that finds them busy. Null when every reader is down.</summary>
-    internal static Pg? LeastLoaded(Pg[] pgs, int readers)
+    /// carry every pass and the others stay free for a pass that finds them busy. A reader that has gone silent on
+    /// what it owes (<see cref="Pg.Stalled"/>) is taken only when all of them have: reads queued behind a lost
+    /// packet wait for it, however few they are. Null when every reader is down.</summary>
+    internal static Pg? LeastLoaded(Pg[] pgs, int readers, long now)
     {
         Pg? best = null;
+        bool bestStalled = true;
         for (int i = 0; i < readers; i++)
         {
             Pg c = pgs[i];
-            if (!c.Broken && (best == null || c.Pending < best.Pending)) best = c;
+            if (c.Broken) continue;
+            bool stalled = c.Stalled(now);
+            if (best == null || (bestStalled && !stalled) || (bestStalled == stalled && c.Pending < best.Pending))
+            {
+                best = c;
+                bestStalled = stalled;
+            }
         }
         return best;
     }

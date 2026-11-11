@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# loss.sh <label> <entry dir> <users> <think scale> <hold s> <pg loss %> <client loss %> [cpus]
+# loss.sh <label> <entry dir> <users> <think scale> <hold s> <pg loss %> <client loss %> [cpus] [NAME=value ...]
 #
 # One load run against a built entry with packets dropped on purpose, as the scoring box's network drops them near
 # its limit: <pg loss> of the packets between the server and Postgres (each way) and <client loss> of the packets
@@ -10,6 +10,7 @@
 # OUTPUT would tell its TCP the packet never left, which is not what a lost packet looks like.
 set -euo pipefail
 label=$1 entry=$2 users=$3 think=$4 hold=$5 pg_loss=$6 cl_loss=$7 cpus=${8:-0}
+extra="${*:9}"   # the server's environment on top of the challenge's: this branch's lab switches
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 [[ "$entry" = /* ]] || entry="$ROOT/$entry"
 OUT="$ROOT/lab/out"; mkdir -p "$OUT"
@@ -20,15 +21,12 @@ pgip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end
 pgpid=$(docker inspect -f '{{.State.Pid}}' "$cid")
 inpg() { sudo nsenter -t "$pgpid" -n "$@"; }
 
-clear_rules() {
-  for c in INPUT OUTPUT; do
-    while sudo iptables -D $c -j MU_COUNT 2>/dev/null; do :; done
-    while sudo iptables -D $c -j MU_LOSS 2>/dev/null; do :; done
-  done
-  for c in MU_COUNT MU_LOSS; do sudo iptables -F $c 2>/dev/null || true; sudo iptables -X $c 2>/dev/null || true; done
-  while inpg iptables -D INPUT -j MU_LOSS 2>/dev/null; do :; done
-  inpg iptables -F MU_LOSS 2>/dev/null || true; inpg iptables -X MU_LOSS 2>/dev/null || true
+# removes every rule of ours from the built-in chains, then our chains, here and in Postgres's namespace
+clear_in() {
+  "$@" iptables -S | grep -E '^-A (INPUT|OUTPUT) .*-j MU_' | sed 's/^-A/-D/' | while read -r rule; do "$@" iptables $rule; done
+  for c in MU_COUNT MU_LOSS; do "$@" iptables -F $c 2>/dev/null || true; "$@" iptables -X $c 2>/dev/null || true; done
 }
+clear_rules() { clear_in sudo; clear_in sudo nsenter -t "$pgpid" -n; }
 trap clear_rules EXIT
 clear_rules
 
@@ -46,7 +44,7 @@ count -i lo --dport 3000:3001                                  # 6 clients -> se
 sudo iptables -I INPUT -j MU_COUNT
 sudo iptables -I OUTPUT -o "$(ip -o route get "$pgip" | grep -o 'dev [^ ]*' | cut -d' ' -f2)" -j MU_COUNT
 
-sudo bash -c "ulimit -n 2000000; cd '$entry' && exec taskset -c $cpus env DATABASE_URL=postgres://postgres:postgres@$pgip:5432/$DB \
+sudo bash -c "ulimit -n 2000000; cd '$entry' && exec taskset -c $cpus env $extra DATABASE_URL=postgres://postgres:postgres@$pgip:5432/$DB \
   JWT_SECRET=million-users-challenge HOST=0.0.0.0 PORT=3000 EXTRA_PORT=3001 bash start.sh" > "$OUT/$label.server.log" 2>&1 &
 server=$!
 for _ in $(seq 60); do curl -sf http://127.0.0.1:3000/health >/dev/null && break; sleep 1; done

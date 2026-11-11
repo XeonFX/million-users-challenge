@@ -51,21 +51,21 @@ public sealed class PassTests
         Reads(a, 3);
         Reads(b, 1);
         Reads(c, 2);
-        Assert.Same(b, Loop.LeastLoaded([a, b, c], 3));
+        Assert.Same(b, Loop.LeastLoaded([a, b, c], 3, T));
         Take(a, 3);
-        Assert.Same(a, Loop.LeastLoaded([a, b, c], 3));
+        Assert.Same(a, Loop.LeastLoaded([a, b, c], 3, T));
     }
 
     [Fact]
     public void AmongEquallyLoadedReadersTheFirstCarriesThePass()
     {
         Pg a = Reader(), b = Reader(), c = Reader();
-        Assert.Same(a, Loop.LeastLoaded([a, b, c], 3));
+        Assert.Same(a, Loop.LeastLoaded([a, b, c], 3, T));
         Reads(a, 1);
-        Assert.Same(b, Loop.LeastLoaded([a, b, c], 3));
+        Assert.Same(b, Loop.LeastLoaded([a, b, c], 3, T));
         Reads(b, 1);
         Reads(c, 1);
-        Assert.Same(a, Loop.LeastLoaded([a, b, c], 3));
+        Assert.Same(a, Loop.LeastLoaded([a, b, c], 3, T));
     }
 
     [Fact]
@@ -74,10 +74,10 @@ public sealed class PassTests
         Pg a = Reader(), b = Reader();
         Reads(b, 5);
         a.Broken = true;
-        Assert.Same(b, Loop.LeastLoaded([a, b], 2));
+        Assert.Same(b, Loop.LeastLoaded([a, b], 2, T));
         b.Broken = true;
-        Assert.Null(Loop.LeastLoaded([a, b], 2));
-        Assert.Null(Loop.LeastLoaded([], 0));
+        Assert.Null(Loop.LeastLoaded([a, b], 2, T));
+        Assert.Null(Loop.LeastLoaded([], 0, T));
     }
 
     [Fact]
@@ -85,7 +85,7 @@ public sealed class PassTests
     {
         Pg reader = Reader(), writer = Writer();
         Reads(reader, 40);
-        Assert.Same(reader, Loop.LeastLoaded([reader, writer], 1));
+        Assert.Same(reader, Loop.LeastLoaded([reader, writer], 1, T));
     }
 
     // ---- nudging a silent connection
