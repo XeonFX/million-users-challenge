@@ -43,14 +43,11 @@ CRC-32.
   of an exchange, or one that was lost again when it was resent) waits out a timer of 200 ms that doubles. And TCP
   at Postgres's end shrinks the connection's window at every loss, so a few connections that carry everything stop
   carrying it. This is what keeps the reads moving:
-  - *A guard behind every batch and group.* One more Sync, sent as a packet of its own. It carries nothing; it is
-    there to be the last packet instead of the work. A lost batch is then reported by the guard's arrival, and a
-    lost end of a reply by the guard's ReadyForQuery, which Postgres sends in a packet of its own right after the
-    reply. A lost guard costs nothing: nobody waits for it.
   - *Nudges.* A connection that owes replies and has been silent for 5 ms (20 ms for a writer: a commit waits for
     its WAL flush) gets a lone Sync, and another every 5 ms while it stays silent, four of them, then less often,
     down to one every 80 ms. Each reaches Postgres past the hole, or its ReadyForQuery reaches the server past it,
-    and the side that sent the lost packet resends it at once. On a quiet network none are sent.
+    and the side that sent the lost packet resends it at once, where the timer would take 200 ms. On a quiet
+    network none are sent, so it costs no packets there.
   - *Readers by the hundred.* 496 connections in all, under the 512 of rule 5: 116 readers a loop on 4 cores, 58 on
     8, 29 on 16. A quiet network uses eight a loop. Under loss a batch takes longer, more are out at once, and each
     is on a reader of its own: a reader that has gone silent on what it owes is never given a batch while another

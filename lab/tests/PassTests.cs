@@ -9,9 +9,9 @@ using Xunit;
 
 namespace MillionUsers.Epoll.Tests;
 
-/// <summary>What a loop pass leaves on a Postgres connection: which reader takes its reads, the guard behind every
-/// batch, when a connection that stays silent is nudged with a Sync, how the batch size follows the reads' waits, and
-/// how long the loop may wait for the next event.</summary>
+/// <summary>What a loop pass leaves on a Postgres connection: which reader takes its reads, when a connection that
+/// stays silent is nudged with a Sync, how the batch size follows the reads' waits, and how long the loop may wait
+/// for the next event.</summary>
 public sealed class PassTests
 {
     const long T = 1_000_000_000; // a Stopwatch timestamp well past 0
@@ -198,54 +198,7 @@ public sealed class PassTests
         Assert.False(pg.Stalled(T + 900 * Stall));
     }
 
-    // ---- the guard behind a batch
-
-    [Fact]
-    public void ABatchIsFollowedByOneSyncMoreWhichLeavesInASendOfItsOwn()
-    {
-        Pg pg = Reader();
-        Reads(pg, 2);
-        pg.Seal(T);
-        Assert.Equal("BEBESS", Types(pg.Unsent));
-        Assert.Equal("BEBES", Types(pg.FirstPacket));
-        Assert.Equal(pg.Unsent.Length - 5, pg.FirstPacket.Length);
-        Assert.True(pg.WantsWrite);
-        // the guard asks nothing: the two reads are all that waits
-        Assert.Equal(2, pg.Pending);
-    }
-
-    [Fact]
-    public void AGroupOfWritesIsGuardedTheSameWay()
-    {
-        Pg pg = Writer();
-        pg.Group.Add(new WriteJob { Kind = WriteJob.Like, UserId = 7, PostId = 9 });
-        pg.SendGroup(T);
-        Assert.Equal("BESS", Types(pg.Unsent));
-        Assert.Equal("BES", Types(pg.FirstPacket));
-    }
-
-    [Fact]
-    public void WhenTwoBatchesWaitForOneFlushTheLastGuardIsTheSendOfItsOwn()
-    {
-        Pg pg = Reader();
-        Reads(pg, 1);
-        pg.Seal(T);
-        Reads(pg, 2);
-        pg.Seal(T + 1);
-        Assert.Equal("BESSBEBESS", Types(pg.Unsent));
-        Assert.Equal("BESSBEBES", Types(pg.FirstPacket));
-    }
-
-    [Fact]
-    public void ANudgeBehindAnUnsentGuardGoesWithIt()
-    {
-        Pg pg = Reader();
-        Reads(pg, 1);
-        pg.Seal(T);
-        pg.Nudge(T + R);
-        Assert.Equal("BESSS", Types(pg.Unsent));
-        Assert.Equal("BES", Types(pg.FirstPacket));
-    }
+    // ---- what sealing a batch leaves
 
     [Fact]
     public void SealingStampsEachReadOfTheBatchAndTheReaderWithTheTime()
@@ -277,15 +230,16 @@ public sealed class PassTests
     static readonly byte[] Bound = [(byte)'2', 0, 0, 0, 4], Inserted = [(byte)'C', 0, 0, 0, 15, .. "INSERT 0 1\0"u8],
         Ready = [(byte)'Z', 0, 0, 0, 5, (byte)'I'];
 
-    /// <summary>A writer answers its writes at the ReadyForQuery of their group's Sync and no other: the guard's and
-    /// a nudge's ReadyForQuery commit nothing, so they must not be taken for the next group's.</summary>
+    /// <summary>A writer answers its writes at the ReadyForQuery of their group's Sync and no other: a nudge's
+    /// ReadyForQuery commits nothing, so it must not be taken for the next group's.</summary>
     [Fact]
-    public void AGuardsOrANudgesAnswerIsNeverTakenForAGroupsCommit()
+    public void ANudgesAnswerIsNeverTakenForAGroupsCommit()
     {
         Pg pg = Writer();
         pg.Group.Add(new WriteJob { Kind = WriteJob.Like, UserId = 7, PostId = 9 });
         pg.SendGroup(T);
-        pg.Nudge(T + W); // the group's Sync, its guard, a nudge: three ReadyForQuerys are owed
+        pg.Nudge(T + W);
+        pg.Nudge(T + 2 * W); // the group's Sync and two nudges: three ReadyForQuerys are owed
 
         Arrives(pg, Bound, Inserted, Ready);
         Assert.True(pg.NextReply(out ReadOnlySpan<byte> reply, out bool group));
@@ -294,20 +248,21 @@ public sealed class PassTests
         Assert.False(pg.NextReply(out _, out _)); // nothing more has come
         pg.Group.Clear(); // the loop answered the write
 
-        // the next group leaves before the guard's and the nudge's answers are in
+        // the next group leaves before the nudges' answers are in, and is nudged once itself
         pg.Group.Add(new WriteJob { Kind = WriteJob.Like, UserId = 8, PostId = 9 });
-        pg.SendGroup(T + 2 * W);
+        pg.SendGroup(T + 3 * W);
+        pg.Nudge(T + 4 * W);
         Arrives(pg, Ready);
         Assert.True(pg.NextReply(out _, out group));
-        Assert.False(group); // the first group's guard
+        Assert.False(group); // the first nudge
         Arrives(pg, Ready);
         Assert.True(pg.NextReply(out _, out group));
-        Assert.False(group); // the nudge
+        Assert.False(group); // the second
         Arrives(pg, Bound, Inserted, Ready, Ready);
         Assert.True(pg.NextReply(out _, out group));
         Assert.True(group); // the second group's commit
         Assert.True(pg.NextReply(out _, out group));
-        Assert.False(group); // and its guard
+        Assert.False(group); // and its nudge
         Assert.False(pg.NextReply(out _, out _));
     }
 
@@ -338,10 +293,11 @@ public sealed class PassTests
 
         Assert.Equal(T + R, pg.Nudge(T));
         Assert.Equal(T + R, pg.Nudge(T + R - 1));
-        Assert.Equal("BEBESS", Types(pg.Unsent)); // not yet
+        Assert.Equal("BEBES", Types(pg.Unsent)); // not yet
 
         long next = pg.Nudge(T + R);
-        Assert.Equal("BEBESSS", Types(pg.Unsent));
+        Assert.Equal("BEBESS", Types(pg.Unsent));
+        Assert.True(pg.WantsWrite);
         Assert.Equal(T + 2 * R, next);
         // the reads are still waiting, in order
         Assert.Equal(2, pg.Pending);
@@ -362,7 +318,7 @@ public sealed class PassTests
             Assert.Equal(now + Ms(gap), pg.Nudge(now));
             now += Ms(gap);
         }
-        Assert.Equal("BES" + "S" + new string('S', gaps.Length), Types(pg.Unsent));
+        Assert.Equal("BES" + new string('S', gaps.Length), Types(pg.Unsent));
     }
 
     [Fact]
@@ -375,7 +331,7 @@ public sealed class PassTests
         pg.SendGroup(T);
         Assert.True(pg.Owes);
         Assert.Equal(T + W, pg.Nudge(T + R)); // a reader's time is too soon for a commit
-        Assert.Equal("BEBESS", Types(pg.Unsent));
+        Assert.Equal("BEBES", Types(pg.Unsent));
 
         long[] gaps = [20, 20, 20, 40, 80, 80];
         long now = T + W;
@@ -384,7 +340,7 @@ public sealed class PassTests
             Assert.Equal(now + Ms(gap), pg.Nudge(now));
             now += Ms(gap);
         }
-        Assert.Equal("BEBESS" + new string('S', gaps.Length), Types(pg.Unsent));
+        Assert.Equal("BEBES" + new string('S', gaps.Length), Types(pg.Unsent));
     }
 
     [Fact]
@@ -407,7 +363,7 @@ public sealed class PassTests
         pg.Seal(T + R / 2);
         Assert.Equal(T + R, pg.Nudge(T + R / 2));
         pg.Nudge(T + R);
-        Assert.Equal("BESSBESSS", Types(pg.Unsent));
+        Assert.Equal("BESBESS", Types(pg.Unsent));
         // and the reader has been silent since the first batch, not the second
         Assert.Equal(R, pg.SilentFor(T + R));
     }
@@ -435,11 +391,11 @@ public sealed class PassTests
         pg.Seal(T);
         pg.Broken = true;
         Assert.Equal(long.MaxValue, pg.Nudge(T + 10 * N));
-        Assert.Equal("BESS", Types(pg.Unsent));
+        Assert.Equal("BES", Types(pg.Unsent));
     }
 
     [Fact]
-    public void ClosingForgetsTheNudgesTheGuardAndWhatWasOwed()
+    public void ClosingForgetsTheNudgesAndWhatWasOwed()
     {
         Pg pg = Reader();
         Reads(pg, 1);
@@ -447,22 +403,21 @@ public sealed class PassTests
         for (int k = 1; k <= 6; k++) pg.Nudge(T + k * N); // well into the doubled intervals
         pg.Close();
         Assert.True(pg.Unsent.IsEmpty);
-        Assert.True(pg.FirstPacket.IsEmpty);
         Take(pg, 1); // the loop fails what it owed
         pg.Broken = false; // reconnected
         Reads(pg, 1);
         pg.Seal(T + 100 * N);
-        Assert.Equal("BES", Types(pg.FirstPacket));
+        Assert.Equal("BES", Types(pg.Unsent));
         Assert.Equal(T + 100 * N + R, pg.Nudge(T + 100 * N));
         // the first nudges are at the short interval again
         Assert.Equal(T + 100 * N + 2 * R, pg.Nudge(T + 100 * N + R));
     }
 
-    /// <summary>Whatever a connection is asked to do, what it has queued is whole messages, with two Syncs per sealed
-    /// batch (its own and its guard) and one per nudge; it is nudged only while it owes something and has been
-    /// silent long enough; and its first send never ends in the middle of a batch.</summary>
+    /// <summary>Whatever a connection is asked to do, what it has queued is whole messages, with one Sync per sealed
+    /// batch and one per nudge; it is nudged only while it owes something and has been silent long enough, and never
+    /// later than the cap after the last one.</summary>
     [Fact]
-    public void WhateverHappensTheWireHoldsWholeMessagesTwoSyncsPerBatchAndOnePerNudge()
+    public void WhateverHappensTheWireHoldsWholeMessagesAndOneSyncPerBatchAndNudge()
     {
         var steps = from kind in Gen.Choose(0, 3)
                     from n in Gen.Choose(1, 5)
@@ -482,7 +437,7 @@ public sealed class PassTests
                         Reads(pg, n);
                         break;
                     case 1:
-                        if (pg.Open > 0) syncs += 2;
+                        if (pg.Open > 0) syncs++;
                         sent += pg.Open;
                         pg.Seal(now);
                         break;
@@ -493,7 +448,7 @@ public sealed class PassTests
                         break;
                     default:
                         // the loop ends a pass by sealing its batch, then nudges: no batch is open at a nudge
-                        if (pg.Open > 0) syncs += 2;
+                        if (pg.Open > 0) syncs++;
                         sent += pg.Open;
                         pg.Seal(now);
                         bool owed = pg.Owes;
@@ -510,12 +465,9 @@ public sealed class PassTests
                 Assert.Equal(sent - answered > 0, pg.Owes);
                 Assert.Equal(sent - answered > 0, pg.SilentFor(now + 1) > 0);
             }
-            string all = Types(pg.Unsent), first = Types(pg.FirstPacket);
+            string all = Types(pg.Unsent);
             Assert.Equal(syncs, all.Count(t => t == 'S'));
-            Assert.StartsWith(first, all, StringComparison.Ordinal);
-            // what stays for the second send is Syncs only: the last guard and the nudges behind it
-            Assert.DoesNotContain(all[first.Length..], c => c != 'S');
-            if (all.Length > 0) Assert.EndsWith("S", first, StringComparison.Ordinal);
+            if (all.Length > 0) Assert.EndsWith("S", all, StringComparison.Ordinal);
         }).QuickCheckThrowOnFailure();
     }
 

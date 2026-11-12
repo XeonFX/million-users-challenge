@@ -50,8 +50,8 @@ sealed class WriteJob
 /// One Postgres connection, owned by one loop: the spec's statements prepared once as it opens, then reads sent as
 /// Bind and Execute, a batch of them under one Sync (one ReadyForQuery, one flush on the server), pipelined; and each
 /// group of writes as Binds and Executes under one Sync: one transaction, one commit. Parameters are binary; a post's
-/// columns come in whichever format is shorter (<see cref="PostColumnFormats"/>). Lost packets are what it is built
-/// around: <see cref="Guard"/>, <see cref="Nudge"/> and <see cref="Stalled"/>.
+/// columns come in whichever format is shorter (<see cref="PostColumnFormats"/>). A connection that goes silent on
+/// what it owes has most likely lost a packet: <see cref="Nudge"/> and <see cref="Stalled"/>.
 /// </summary>
 sealed class Pg
 {
@@ -70,8 +70,11 @@ sealed class Pg
     /// <summary>A reader that owes replies and has been silent this long counts as stalled: new batches go to the
     /// others (<see cref="Loop.NextReader"/>).</summary>
     public const int StallAfterMs = 4;
-    /// <summary>How long a connect, and each answer of the login, may take.</summary>
+    /// <summary>How long each answer of the login may take.</summary>
     const int LoginTimeoutMs = 2_000;
+    /// <summary>How long a connect may take, from when it was started to when the loop gets to it: a loop logs its
+    /// connections in one after another, so the last of a hundred has waited for the others.</summary>
+    const int ConnectTimeoutMs = 10_000;
     /// <summary>How long a dropped connection waits before it reconnects.</summary>
     const int ReconnectDelayMs = 1000;
 
@@ -139,9 +142,6 @@ sealed class Pg
     long _nudgeDue;
     /// <summary>Nudges sent since it last heard from Postgres.</summary>
     int _nudges;
-    /// <summary>Where the Sync that guards the last batch or group starts in <see cref="_out"/>, so <see cref="Flush"/>
-    /// sends it as a packet of its own; -1 when none waits.</summary>
-    int _guard = -1;
     /// <summary>When the reader's last batch was sealed (a Stopwatch timestamp): the readers take turns by it.</summary>
     public long LastUsed;
 
@@ -181,7 +181,7 @@ sealed class Pg
         }
         Fd = fd;
         Connecting = true;
-        ConnectDeadline = Environment.TickCount64 + LoginTimeoutMs;
+        ConnectDeadline = Environment.TickCount64 + ConnectTimeoutMs;
     }
 
     /// <summary>Once connected: logs in and prepares the statements, waiting two seconds at most for each answer.</summary>
@@ -345,10 +345,8 @@ sealed class Pg
         if (Fd >= 0) Native.close(Fd);
         Fd = -1;
         _outLength = _outSent = _sealed = _inStart = _inEnd = 0;
-        _guard = -1;
         Open = 0;
         _syncs.Clear();
-        _nudges = 0;
     }
 
     // ---- reads
@@ -386,8 +384,7 @@ sealed class Pg
     }
 
     /// <summary>Ends the open batch with one Sync; it goes with the next flush. Its reads share one implicit
-    /// transaction (each still takes its own snapshot), and an error skips the reads after it up to the Sync.
-    /// A second Sync follows as its <see cref="Guard"/>.</summary>
+    /// transaction (each still takes its own snapshot), and an error skips the reads after it up to the Sync.</summary>
     public void Seal(long now)
     {
         if (Open == 0) return;
@@ -397,21 +394,6 @@ sealed class Pg
         PutBytes(SyncMessage);
         _waiters[(_waiterHead + _waiterCount - 1) % _waiters.Length].Last = true;
         Open = 0;
-        Guard();
-    }
-
-    /// <summary>Queues one more Sync behind a batch or group, which <see cref="Flush"/> sends as a packet of its own.
-    /// It carries nothing; it is there to be the last packet instead of the work. TCP notices a lost packet at once
-    /// when a later one arrives, but the last packet of an exchange has none after it and waits for a timer: 200 ms
-    /// when it was the only one in flight, as a batch of requests is and a group's reply is. With the guard behind
-    /// it, a lost batch is reported by the guard's arrival, and a lost end of a reply by the arrival of the guard's
-    /// ReadyForQuery, which Postgres sends in a packet of its own right after the reply. A lost guard costs
-    /// nothing: nobody waits for it.</summary>
-    void Guard()
-    {
-        _guard = _outLength;
-        PutBytes(SyncMessage);
-        if (_writer) _syncs.Enqueue(false);
         _sealed = _outLength;
     }
 
@@ -434,12 +416,12 @@ sealed class Pg
 
     /// <summary>Sends a lone Sync when the connection owes replies and has been silent for
     /// <see cref="ReadNudgeAfterMs"/> (<see cref="WriteNudgeAfterMs"/> for a writer), and again at that interval
-    /// while it stays silent (<see cref="SteadyNudges"/>). What the <see cref="Guard"/> does for one lost packet,
-    /// nudges do for whatever is left: a guard that was lost with its batch, a packet lost again when it was resent,
-    /// a hole with nothing behind it. Each Sync reaches Postgres past the hole, or its ReadyForQuery reaches us past
-    /// it, and the side that sent the lost packet resends it at once instead of at its retransmit timer, 200 ms or
-    /// more away and doubling. The loop seals the pass's batch before it nudges, so no batch is open here.
-    /// Returns when the next nudge is due (long.MaxValue when nothing is owed).</summary>
+    /// while it stays silent (<see cref="SteadyNudges"/>). TCP notices a lost packet at once when a later one
+    /// arrives, but a packet with none after it waits for a timer, 200 ms at least and doubling: a batch of
+    /// requests, which is one packet; the end of a reply; a packet lost again when it was resent. The Sync is that
+    /// later packet. It reaches Postgres past the hole, or its ReadyForQuery reaches us past it, and the side that
+    /// sent the lost packet resends it at once. The loop seals the pass's batch before it nudges, so no batch is
+    /// open here. Returns when the next nudge is due (long.MaxValue when nothing is owed).</summary>
     public long Nudge(long now)
     {
         if (Broken || !Owes) return long.MaxValue;
@@ -491,23 +473,21 @@ sealed class Pg
             PutBytes(ExecuteMessage);
         }
         PutBytes(SyncMessage);
-        Guard();
+        _sealed = _outLength;
     }
 
     // ---- the socket
 
-    /// <summary>Sends what is queued: what comes before the <see cref="Guard"/> in one send and the guard in the
-    /// next, so they leave as two packets. False on an error; <see cref="WantsWrite"/> says whether some is left.</summary>
+    /// <summary>Sends what is queued. False on an error; <see cref="WantsWrite"/> says whether some is left.</summary>
     public bool Flush()
     {
         while (_outSent < _sealed)
         {
-            int n = Native.Send(Fd, _out, _outSent, FirstPacket.Length);
+            int n = Native.Send(Fd, _out, _outSent, _sealed - _outSent);
             if (n < 0) return false;
             if (n == 0) return true;
             _outSent += n;
         }
-        _guard = -1;
         if (_outSent == _outLength) _outLength = _outSent = _sealed = 0;
         else if (_outSent > 0)
         {
@@ -518,10 +498,6 @@ sealed class Pg
         }
         return true;
     }
-
-    /// <summary>What the next send takes: the unsent bytes up to the <see cref="Guard"/>, or all of them once those
-    /// are out.</summary>
-    public ReadOnlySpan<byte> FirstPacket => _out.AsSpan(_outSent, (_guard > _outSent ? _guard : _sealed) - _outSent);
 
     /// <summary>Reads what arrived. False when the connection is gone; <paramref name="more"/> when the buffer
     /// filled, so more may be waiting.</summary>

@@ -65,14 +65,15 @@ jobs:
       matrix:
         include:
           # Postgres link loss % : client link loss %. "in" drops only what comes in to the server.
-          # new4 is this branch's build given the connections one loop has on a 4-core box (124 of the 496), and
-          # bare4 the same without the guard behind each batch: is the guard worth its two packets a batch?
-          - { conditions: "0:0 5:5 10:10 15:15 18:18", dir: in, cpus: "0", think: "0.25", users: 16000, builds: "new4 bare4" }
-          - { conditions: "10:10 12:12 15:15", dir: both, cpus: "0", think: "0.25", users: 16000, builds: "new4 bare4" }
+          # new4 is this branch's build given the connections one loop has on a 4-core box (124 of the 496).
+          - { conditions: "0:0 5:5 10:10 15:15 18:18 20:20", dir: in, cpus: "0", think: "0.25", users: 16000, builds: "base new4" }
+          - { conditions: "5:5 10:10 12:12 15:15", dir: both, cpus: "0", think: "0.25", users: 16000, builds: "base new4" }
           # nearer a scoring loop's rate, as far as the runner's four cores carry Postgres and the load with it
-          - { conditions: "0:0 10:10 15:15", dir: in, cpus: "0", think: "0.25", users: 28000, builds: "base new4 bare4" }
+          - { conditions: "0:0 10:10 15:15", dir: in, cpus: "0", think: "0.25", users: 28000, builds: "base new4" }
           # every loop the runner's four cores give, at a low rate a loop (as 16 cores have at a million users)
-          - { conditions: "0:0 10:10", dir: in, cpus: "0-3", think: "0.25", users: 16000, builds: "new bare" }
+          - { conditions: "0:0 10:10 15:15", dir: in, cpus: "0-3", think: "0.25", users: 16000, builds: "base new" }
+          # the scoring run's think time, keep-alives and all
+          - { conditions: "0:0", dir: in, cpus: "0", think: "2.5", users: 40000, builds: "base new4" }
     services:
       postgres:
         image: postgres:18
@@ -111,13 +112,9 @@ jobs:
               text = open(path).read()
               assert text.count(old[1]) == 1, (name, path)
               open(path, "w").write(text.replace(old[1], new))
-          guard = ("Pg.cs", "        _guard = _outLength;\n        PutBytes(SyncMessage);\n        if (_writer) _syncs.Enqueue(false);\n        _sealed = _outLength;")
-          four = ("Program.cs", "const int Connections = 496;")
-          variant("bare", "new", guard, "        _sealed = _outLength;")
-          variant("new4", "new", four, "const int Connections = 124;")
-          variant("bare4", "bare", four, "const int Connections = 124;")
+          variant("new4", "new", ("Program.cs", "const int Connections = 496;"), "const int Connections = 124;")
           PY
-          for b in base new bare new4 bare4; do bash /tmp/v/$b/build.sh > /dev/null; done
+          for b in base new new4; do bash /tmp/v/$b/build.sh > /dev/null; done
       - name: runs
         run: |
           mkdir -p lab/out && python3 lab/loss_summary.py header > lab/out/loss.tsv

@@ -316,7 +316,7 @@ public sealed class FakePgTests : IDisposable
     static int Count(string log, char c) => log.Count(x => x == c);
 
     /// <summary>The batches and groups in a log: each run of statements with the Sync that ends it. The Syncs behind
-    /// it (its guard, then nudges while the fake holds its answer) aren't batches.</summary>
+    /// it (nudges, while the fake holds its answer) aren't batches.</summary>
     static string[] Batches(string log) => [.. System.Text.RegularExpressions.Regex.Matches(log, "[a-z]+S").Select(m => m.Value[..^1])];
 
     /// <summary>The server's connections in one loop: 488 readers and 8 writers.</summary>
@@ -346,8 +346,6 @@ public sealed class FakePgTests : IDisposable
         // one batch a pass, not one a read: a few passes at most took them, each on a reader of its own
         Assert.InRange(logs.Sum(l => Batches(l).Length), 1, 4);
         Assert.All(logs, l => Assert.Single(Batches(l)));
-        // and behind each batch's Sync comes its guard
-        Assert.All(logs, l => Assert.StartsWith(Batches(l)[0] + "SS", l, StringComparison.Ordinal));
         Assert.Contains(logs, l => l.Contains("pppppppppp", StringComparison.Ordinal));
 
         foreach (FakeConn c in _pg.Conns) c.Answer(int.MaxValue);
@@ -374,7 +372,7 @@ public sealed class FakePgTests : IDisposable
     }
 
     [Fact]
-    public void ReadsOneAfterAnotherTakeTurnsOverTheReadersEachBatchWithItsGuard()
+    public void ReadsOneAfterAnotherTakeTurnsOverTheReaders()
     {
         Client client = Connect();
         Assert.Equal(200, client.Get("/health").Status);
@@ -387,7 +385,8 @@ public sealed class FakePgTests : IDisposable
             Thread.Sleep(5); // the reader is free again; the next read still goes to one that has waited longer
         }
         string[] logs = [.. _pg.Conns.Select(c => c.Log).Where(l => l.Length > 0)];
-        Assert.Equal(["pSS", "pSS", "pSS", "pSS", "pSS"], logs);
+        // answered at once, so no nudge follows: on a quiet network a read costs its batch's packets and no more
+        Assert.Equal(["pS", "pS", "pS", "pS", "pS"], logs);
     }
 
     [Fact]
@@ -405,19 +404,18 @@ public sealed class FakePgTests : IDisposable
         Assert.Equal(1, other.Answer());
         Assert.Equal(22, clients[1].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
 
-        // the batch's Sync and its guard at once; after 5 ms of silence a lone Sync, and another 5 ms later
-        _pg.WaitFor(_ => silent.Log.Length >= 5, 1000, "two nudges");
-        Assert.StartsWith("pSSSS", silent.Log, StringComparison.Ordinal);
-        Assert.InRange(silent.TimeOf(2) - silent.TimeOf(1), 0, 3); // the guard, right behind
-        Assert.InRange(silent.TimeOf(3) - silent.TimeOf(1), 4, 60);
-        Assert.InRange(silent.TimeOf(4) - silent.TimeOf(3), 3, 60);
+        // after 5 ms of silence a lone Sync, and another 5 ms later
+        _pg.WaitFor(_ => silent.Log.Length >= 4, 1000, "two nudges");
+        Assert.StartsWith("pSSS", silent.Log, StringComparison.Ordinal);
+        Assert.InRange(silent.TimeOf(2) - silent.TimeOf(1), 4, 60);
+        Assert.InRange(silent.TimeOf(3) - silent.TimeOf(2), 3, 60);
         // then they back off to one every 80 ms: about ten in the first 400 ms, where one every 5 ms would be 80
         Thread.Sleep(400);
-        Assert.InRange(Count(silent.Log, 'S') - 2, 6, 20);
+        Assert.InRange(Count(silent.Log, 'S') - 1, 6, 20);
         Assert.False(clients[0].Hears(0));
 
         // the reply and every other ReadyForQuery arrive: the read is answered, once, and the reader works on
-        Assert.InRange(silent.Answer(int.MaxValue), 8, 30);
+        Assert.InRange(silent.Answer(int.MaxValue), 7, 30);
         Assert.Equal(11, clients[0].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
         Assert.False(clients[0].Hears(50));
         _pg.Clear();
@@ -476,26 +474,27 @@ public sealed class FakePgTests : IDisposable
     }
 
     [Fact]
-    public void AGuardsAndANudgesAnswerAreNotTakenForTheNextGroupsCommit()
+    public void ANudgesAnswerIsNotTakenForTheNextGroupsCommit()
     {
         Client[] clients = HeldClients(2);
         clients[0].Send(Like(1));
         FakeConn writer = _pg.WaitFor(l => l.StartsWith("lS", StringComparison.Ordinal), what: "the like");
-        // its Sync, its guard, and after 20 ms of silence a nudge
-        _pg.WaitFor(_ => writer.Log.StartsWith("lSSS", StringComparison.Ordinal), 1000, "the nudge");
-        Assert.InRange(writer.TimeOf(3) - writer.TimeOf(1), 15, 120);
+        // after 20 ms of silence, a nudge: a commit is given longer than a read
+        _pg.WaitFor(_ => writer.Log.StartsWith("lSS", StringComparison.Ordinal), 1000, "the nudge");
+        Assert.InRange(writer.TimeOf(2) - writer.TimeOf(1), 15, 120);
 
-        // the commit's answer arrives; the guard's and the nudge's don't yet
+        // the commit's answer arrives; the nudge's doesn't yet
         Assert.Equal(1, writer.Answer());
         Assert.Equal(201, clients[0].Read().Status);
         Thread.Sleep(30);
         int stale = writer.Log.Length - 2; // every Sync but the group's own; no more come once nothing is owed
+        Assert.InRange(stale, 1, 4);
         Thread.Sleep(60);
         Assert.Equal(stale, writer.Log.Length - 2);
 
-        // the next group goes out on the same writer (the first with nothing out), behind the unanswered Syncs
+        // the next group goes out on the same writer (the first with nothing out), behind the unanswered nudges
         clients[1].Send(Like(2));
-        _pg.WaitFor(_ => Count(writer.Log, 'l') == 2 && writer.Log.EndsWith("lSS", StringComparison.Ordinal), 1000, "the second like on the same writer");
+        _pg.WaitFor(_ => Count(writer.Log, 'l') == 2 && writer.Log.EndsWith("lS", StringComparison.Ordinal), 1000, "the second like on the same writer");
         // now the stale ReadyForQuerys: they commit nothing, so the second like must keep waiting
         Assert.Equal(stale, writer.Answer(stale));
         Assert.False(clients[1].Hears(100));
