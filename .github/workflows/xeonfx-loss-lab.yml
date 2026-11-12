@@ -25,6 +25,7 @@ env:
 
 jobs:
   tests:
+    if: ${{ !contains(github.event.head_commit.message, '[rivals]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -57,6 +58,7 @@ jobs:
           dotnet bin/Release/net10.0/Verification.dll -maxThreads 2
 
   loss:
+    if: ${{ !contains(github.event.head_commit.message, '[rivals]') }}
     name: "${{ matrix.conditions }} (loss ${{ matrix.dir }}, cpus ${{ matrix.cpus }}, think ${{ matrix.think }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 75
@@ -132,15 +134,22 @@ jobs:
           path: lab/out
           retention-days: 14
 
+  # the entries that share rank 1 with this one, each as it runs on one CPU: a commit message with [rivals] runs them
   rivals:
     name: ${{ matrix.entry }}
-    if: ${{ false }}   # measured in earlier rounds
+    if: ${{ contains(github.event.head_commit.message, '[rivals]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        entry: [c-epoll-unorig-username, fsharp-kestrel-uring-delneg]
+        include:
+          - { entry: fsharp-kestrel-uring-delneg, pr: "" }
+          - { entry: c-epoll-unorig-username, pr: "" }
+          - { entry: bend-epoll-wyrmkeep, pr: "113" }
+          - { entry: swift-iouring-akbashev, pr: "112" }
+          - { entry: c-ammarserver-AmmarkoV, pr: "116" }
+          - { entry: go-epoll-trungdlp, pr: "65" }
     services:
       postgres:
         image: postgres:18
@@ -151,9 +160,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version-file: bench/mload/go.mod, cache: false }
+      - name: the entry as its pull request has it, where it isn't on main
+        if: ${{ matrix.pr != '' }}
+        run: |
+          git fetch -q https://github.com/arjaythedev/million-users-challenge "pull/${{ matrix.pr }}/head"
+          git checkout -q FETCH_HEAD -- "submissions/${{ matrix.entry }}"
+          git log -1 --format='%H %s' FETCH_HEAD
       - name: tools, Postgres and the box's kernel settings
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl iptables iproute2 util-linux ethtool
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl iptables iproute2 util-linux ethtool psmisc
           psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
           docker restart "$(docker ps -q --filter ancestor=postgres:18)"
           until pg_isready -q; do sleep 1; done
@@ -168,10 +183,10 @@ jobs:
       - name: runs
         run: |
           mkdir -p lab/out && python3 lab/loss_summary.py header > lab/out/loss.tsv
-          short=$(echo "${{ matrix.entry }}" | cut -d- -f1)
-          export LOSS_DIR=in
-          for c in 5:5 10:10 15:15 20:20; do
-            bash lab/loss.sh "$short-pg${c%%:*}-cl${c##*:}-in" submissions/${{ matrix.entry }} $USERS $THINK $HOLD "${c%%:*}" "${c##*:}" 0 || echo "$c: run failed"
+          short=$(echo "${{ matrix.entry }}" | cut -d- -f1,2)
+          for c in in:0:0 in:5:5 in:10:10 in:15:15 in:18:18 both:10:10; do
+            export LOSS_DIR=${c%%:*}; l=${c#*:}
+            bash lab/loss.sh "$short-pg${l%%:*}-cl${l##*:}-$LOSS_DIR" submissions/${{ matrix.entry }} $USERS $THINK $HOLD "${l%%:*}" "${l##*:}" 0 || echo "$c: run failed"
           done
           { echo '```'; column -t -s $'\t' lab/out/loss.tsv; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4

@@ -106,6 +106,8 @@ cpu=$(ps -eo pid=,ppid=,cputimes= | awk -v root="$server" '{ pp[$1] = $2; t[$1] 
   END { for (p in pp) { q = p; while (q in pp && q != root && q != 1) q = pp[q]; if (q == root) s += t[p] } print s + 0 }')
 sudo kill "$server" 2>/dev/null || true   # sudo passes the signal on to the server
 wait "$server" 2>/dev/null || true
+# an entry that forks a worker per CPU can leave them behind: nothing may hold the ports for the next run
+sudo fuser -k 3000/tcp 3001/tcp > /dev/null 2>&1 || true
 for _ in $(seq 20); do curl -s -o /dev/null --max-time 1 http://127.0.0.1:3000/health || break; sleep 0.5; done
 
 grep RESULT "$OUT/$label.mload.log" || { tail -20 "$OUT/$label.mload.log"; exit 1; }
