@@ -25,7 +25,7 @@ env:
 
 jobs:
   tests:
-    if: ${{ !contains(github.event.head_commit.message, '[rivals]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[rivals]') && !contains(github.event.head_commit.message, '[staircase]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -58,7 +58,7 @@ jobs:
           dotnet bin/Release/net10.0/Verification.dll -maxThreads 2
 
   loss:
-    if: ${{ !contains(github.event.head_commit.message, '[rivals]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[rivals]') && !contains(github.event.head_commit.message, '[staircase]') }}
     name: "${{ matrix.conditions }} (loss ${{ matrix.dir }}, cpus ${{ matrix.cpus }}, think ${{ matrix.think }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 75
@@ -193,5 +193,85 @@ jobs:
         if: always()
         with:
           name: loss-${{ matrix.entry }}
+          path: lab/out
+          retention-days: 14
+
+  # the leaderboard's own measure, in the lab: the most users each entry holds when what comes in to it past a packet
+  # rate is dropped. A commit message with [staircase] runs it.
+  staircase:
+    name: "users held: ${{ matrix.name }}"
+    if: ${{ contains(github.event.head_commit.message, '[staircase]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: scored, entry: "", pr: "" }
+          - { name: this, entry: "", pr: "" }
+          - { name: fsharp-kestrel-uring, entry: fsharp-kestrel-uring-delneg, pr: "" }
+          - { name: c-epoll, entry: c-epoll-unorig-username, pr: "" }
+          - { name: bend-epoll, entry: bend-epoll-wyrmkeep, pr: "113" }
+          - { name: swift-iouring, entry: swift-iouring-akbashev, pr: "112" }
+          - { name: c-ammarserver, entry: c-ammarserver-AmmarkoV, pr: "116" }
+          - { name: go-epoll, entry: go-epoll-trungdlp, pr: "65" }
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: bench/mload/go.mod, cache: false }
+      - name: the entry as its pull request has it, where it isn't on main
+        if: ${{ matrix.pr != '' }}
+        run: |
+          git fetch -q https://github.com/arjaythedev/million-users-challenge "pull/${{ matrix.pr }}/head"
+          git checkout -q FETCH_HEAD -- "submissions/${{ matrix.entry }}"
+      - name: tools, Postgres and the box's kernel settings
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl iptables iproute2 util-linux ethtool psmisc
+          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$(docker ps -q --filter ancestor=postgres:18)"
+          until pg_isready -q; do sleep 1; done
+          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" > /dev/null 2>&1 || true
+          sudo modprobe sch_netem 2>/dev/null || echo "no sch_netem module"
+          sudo modprobe xt_hashlimit 2>/dev/null || echo "no xt_hashlimit module"
+          sudo bash box/setup-app-box.sh
+          sudo sysctl -q -w net.ipv4.ip_local_port_range="1024 65535"
+          cd bench/mload && go build -o mload .
+      - run: bash seed/make-seed.sh
+      - name: build
+        run: |
+          mkdir -p /tmp/v
+          case "${{ matrix.name }}" in
+            scored)
+              sudo bash $ENTRY/install.sh > /dev/null
+              git archive "$BASE" $ENTRY | tar -x -C /tmp/v && mv /tmp/v/$ENTRY /tmp/v/entry ;;
+            this)
+              sudo bash $ENTRY/install.sh > /dev/null
+              cp -r $ENTRY /tmp/v/entry
+              # one loop with the connections a 4-core box gives it
+              sed -i 's/const int Connections = 480;/const int Connections = 120;/' /tmp/v/entry/Program.cs
+              grep -q 'const int Connections = 120;' /tmp/v/entry/Program.cs ;;
+            *)
+              sudo bash submissions/${{ matrix.entry }}/install.sh > /dev/null
+              cp -r submissions/${{ matrix.entry }} /tmp/v/entry ;;
+          esac
+          bash /tmp/v/entry/build.sh > /dev/null
+      - name: the staircase, at two packet rates
+        run: |
+          mkdir -p lab/out && python3 lab/loss_summary.py header > lab/out/loss.tsv
+          printf 'entry\tcap\theld\n' > lab/out/held.tsv
+          bash lab/staircase.sh "${{ matrix.name }}" /tmp/v/entry 15000 10000 11000 12000 13000 14000 15000 16000 17000 18000 19000 20000
+          bash lab/staircase.sh "${{ matrix.name }}" /tmp/v/entry 24000 16000 18000 20000 22000 24000 26000 28000 30000
+          { echo '```'; column -t -s $'\t' lab/out/held.tsv; column -t -s $'\t' lab/out/loss.tsv | cut -c1-160; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: held-${{ matrix.name }}
           path: lab/out
           retention-days: 14

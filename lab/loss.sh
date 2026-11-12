@@ -25,7 +25,8 @@ inpg() { sudo nsenter -t "$pgpid" -n "$@"; }
 clear_in() {
   { "$@" iptables -S 2>/dev/null | grep -E '^-A (INPUT|OUTPUT) .*-j MU_' || true; } | sed 's/^-A/-D/' |
     while read -r rule; do "$@" iptables $rule || true; done
-  for c in MU_COUNT MU_LOSS; do "$@" iptables -F $c 2>/dev/null || true; "$@" iptables -X $c 2>/dev/null || true; done
+  for c in MU_COUNT MU_LOSS MU_CAP; do "$@" iptables -F $c 2>/dev/null || true; done
+  for c in MU_COUNT MU_LOSS MU_CAP; do "$@" iptables -X $c 2>/dev/null || true; done
 }
 clear_rules() { clear_in sudo; clear_in sudo nsenter -t "$pgpid" -n; }
 trap clear_rules EXIT
@@ -83,6 +84,16 @@ if [ "$cl_loss" != 0 ]; then
   p=$(prob "$cl_loss")
   sudo iptables -A MU_LOSS -i lo -p tcp --dport 3000:3001 -m statistic --mode random --probability "$p" -j DROP
   [ "$dir" = in ] || sudo iptables -A MU_LOSS -i lo -p tcp --sport 3000:3001 -m statistic --mode random --probability "$p" -j DROP
+fi
+# PPS_CAP=<packets a second>: what comes in to the server past that rate is dropped, Postgres's replies and the
+# clients' packets out of one bucket, as a network path that carries only so many packets would. Retransmissions
+# count against it like anything else.
+if [ -n "${PPS_CAP:-}" ]; then
+  sudo iptables -N MU_CAP
+  sudo iptables -A MU_CAP -m hashlimit --hashlimit-above "${PPS_CAP}/sec" --hashlimit-burst "${PPS_BURST:-$((PPS_CAP / 50))}" \
+    --hashlimit-name mu_in -j DROP
+  sudo iptables -A MU_LOSS -p tcp -s "$pgip" --sport 5432 -j MU_CAP
+  sudo iptables -A MU_LOSS -i lo -p tcp --dport 3000:3001 -j MU_CAP
 fi
 # after the counters: INPUT is MU_COUNT, then MU_LOSS
 sudo iptables -I INPUT 2 -j MU_LOSS
