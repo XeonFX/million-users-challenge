@@ -100,7 +100,7 @@ passes as the challenge's do (p95 under 500 ms, p99 under 1 s).
 | 20 % in | fail | fail, 460 / 1,083 |
 | 5 % each way | pass, 227 / 425 | pass, 216 / 417 |
 | 10 % each way | fail, 6,496 / 8,756 | pass, 319 / 699 |
-| 12 % each way | fail | fail, 425 / 1,021 (another run passed, 425 / 961) |
+| 12 % each way | fail | fail, 425 / 1,021 |
 | 15 % each way | fail | fail, 621 / 1,729 |
 
 Where #114 fails, its reads take seconds and its likes still take about 240 ms. At 28,000 users on the one loop
