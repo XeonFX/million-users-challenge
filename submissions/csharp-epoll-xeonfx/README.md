@@ -80,11 +80,43 @@ CRC-32.
 Login to Postgres is SCRAM-SHA-256 (or trust). A dropped database connection fails what it owed with 500 (503 for
 `/health`) and reconnects within a second.
 
+## Measured with packets dropped on purpose
+
+Not the scoring box: GitHub's 4-core runners (Ubuntu 24.04), Postgres 18 in a container on a bridge, so the link has
+a TCP stack of its own at the far end, with 0.1 ms added each way and no segmentation offload; mload on loopback.
+Packets are dropped at random where they arrive. "In" drops that share of what Postgres sends the server and of what
+the clients send it, as a box whose receive side overflows would; "each way" drops it in both directions on both
+links. One loop with the connections a 4-core box gives it (116 readers, 8 writers), 16,000 users at
+`-think-scale 0.25` (6,200 requests/s), 15 s ramp, 60 s hold, a fresh database each run. p95 / p99 in ms; a run
+passes as the challenge's do (p95 under 500 ms, p99 under 1 s).
+
+| dropped | #114 (8 readers, nudges after 50 ms) | this |
+|---|---|---|
+| none | pass, 4 / 5 | pass, 4 / 5 |
+| 5 % in | pass, 214 / 232 | pass, 210 / 220 |
+| 10 % in | fail, 5,881 / 7,247 | pass, 218 / 425 |
+| 15 % in | fail | pass, 227 / 633 |
+| 18 % in | fail | pass, 425 / 836 |
+| 20 % in | fail | fail, 460 / 1,083 |
+| 5 % each way | pass, 227 / 425 | pass, 216 / 417 |
+| 10 % each way | fail, 6,496 / 8,756 | pass, 319 / 699 |
+| 12 % each way | fail | fail, 425 / 1,021 (another run passed, 425 / 961) |
+| 15 % each way | fail | fail, 621 / 1,729 |
+
+Where #114 fails, its reads take seconds and its likes still take about 240 ms. At 28,000 users on the one loop
+(10,800 requests/s) this passes 10 % in at 246 / 460 and 15 % in at 456 / 870, where #114 fails both. With four
+loops it passes 15 % in at 225 / 633, where #114 fails at 2,816 / 4,451.
+
+On a quiet network it costs nothing: 4.46 packets a request against #114's 4.45 at this load, 4.38 against 4.39 at
+10,800 requests/s, 4.92 against 4.92 with four loops, and 8.25 against 8.26 at the scoring run's think time
+(`-think-scale 2.5`, where the clients' keep-alive probes and their answers are a third of the packets), with the
+same latency.
+
 ## The code
 
 - `Program.cs` starts the loops; `Loop.cs` is the loop itself and its passes, `Loop.Http.cs` its clients
-  (accept, parse, respond), `Loop.Routes.cs` the routes, `Loop.Postgres.cs` the reads, write groups and database
-  connections.
+  (accept, parse, respond), `Loop.Routes.cs` the routes, `Loop.Postgres.cs` the reads (which reader takes a batch,
+  how many reads it holds), write groups and database connections.
 - `Pg.cs` is one Postgres connection on the wire protocol, `Scram.cs` its login.
 - `Json.cs` writes the responses and reads a new post's body, `Gzip.cs` compresses the feed, `Jwt.cs` checks tokens,
   `Native.cs` holds the libc calls.

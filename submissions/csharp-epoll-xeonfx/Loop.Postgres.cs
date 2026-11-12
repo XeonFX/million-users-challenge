@@ -36,8 +36,9 @@ sealed partial class Loop
     /// still answering; a reader that has gone silent on what it owes (<see cref="Pg.Stalled"/>) is taken only when
     /// all of them have, since reads queued behind a lost packet wait for it however few they are. Null when every
     /// reader is down.
-    /// <para>Turns, not always the first free reader: a connection that has just lost packets has a small window
-    /// at Postgres's end, and one that is used again at once never gets to send enough to open it.</para></summary>
+    /// <para>Turns, not always the first free reader: with packets dropped on purpose, about a fifth fewer reads
+    /// stalled that way. A connection that has just lost packets has a small window at Postgres's end; taking
+    /// turns, it isn't the one every next batch goes to.</para></summary>
     internal static Pg? NextReader(Pg[] pgs, int readers, long now, int turns)
     {
         Pg? best = null;
