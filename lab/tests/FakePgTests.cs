@@ -319,8 +319,8 @@ public sealed class FakePgTests : IDisposable
     /// it (nudges, while the fake holds its answer) aren't batches.</summary>
     static string[] Batches(string log) => [.. System.Text.RegularExpressions.Regex.Matches(log, "[a-z]+S").Select(m => m.Value[..^1])];
 
-    /// <summary>The server's connections in one loop: 488 readers and 8 writers.</summary>
-    const int Connections = 496;
+    /// <summary>The server's connections in one loop: 472 readers and 8 writers.</summary>
+    const int Connections = 480;
 
     [Fact]
     public void TheServerRunsOneLoopWithMostOfPostgresConnections()
@@ -369,6 +369,34 @@ public sealed class FakePgTests : IDisposable
         foreach (FakeConn c in _pg.Conns) c.Answer(int.MaxValue);
         for (int i = 0; i <= 150; i++)
             Assert.Equal(i + 1, clients[i].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
+    }
+
+    [Fact]
+    public void WhenEveryConnectionDropsTheyComeBackOneAfterAnotherTheWritersFirst()
+    {
+        Client client = Connect();
+        Assert.Equal(200, client.Get("/health").Status);
+        var until = Stopwatch.StartNew();
+        while (_pg.Conns.Count < Connections && until.ElapsedMilliseconds < 15_000) Thread.Sleep(10);
+        FakeConn[] old = [.. _pg.Conns];
+        Assert.Equal(Connections, old.Length);
+
+        var dropped = Stopwatch.StartNew();
+        foreach (FakeConn c in old) c.Close();
+        // a second, then one every 10 ms: some fifty are back half a second after that, far from all 480. Logging
+        // them all in at once would keep the loop from its clients for as long as the logins take
+        Thread.Sleep(1500 - (int)dropped.ElapsedMilliseconds);
+        Assert.InRange(_pg.Conns.Count - Connections, 5, 200);
+        // the eight writers came first and readers follow: both kinds of request are served while most are still out
+        client.Send(Like(1));
+        Assert.Equal(201, client.Read().Status);
+        Assert.Equal(200, client.Get("/posts/5").Status);
+        Assert.True(_pg.Conns.Count < 2 * Connections);
+
+        // all of them, a second and 480 times 10 ms after the drop
+        while (_pg.Conns.Count < 2 * Connections && dropped.ElapsedMilliseconds < 15_000) Thread.Sleep(20);
+        Assert.Equal(2 * Connections, _pg.Conns.Count);
+        Assert.InRange(dropped.ElapsedMilliseconds, 4_500, 15_000);
     }
 
     [Fact]

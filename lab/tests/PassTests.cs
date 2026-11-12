@@ -531,6 +531,90 @@ public sealed class PassTests
         }).QuickCheckThrowOnFailure();
     }
 
+    // ---- judging the batch size by how the reads fare
+
+    static Loop.Tally Answered(int reads, int late, long since = T) => new() { Reads = reads, Late = late, Since = since };
+
+    [Fact]
+    public void ReadsStillWaitingCountInOneJudgmentAndAreNotCarriedIntoTheNext()
+    {
+        // 200 reads wait on silent readers: they halve the batch now
+        Loop.Tally tally = Answered(0, 0);
+        Assert.Equal(32, Loop.Judged(64, ref tally, waiting: 200, waitingLate: 200, busy: 4, readers: 100, T + 1));
+        Assert.Equal((0, 0, T + 1), (tally.Reads, tally.Late, tally.Since));
+
+        // the next quarter second 400 reads are answered at once and none waits: the batch grows back. Had the 200
+        // been kept in the count, a third of the reads would still look late and it would halve again
+        tally.Reads = 400;
+        Assert.Equal(64, Loop.Judged(32, ref tally, waiting: 0, waitingLate: 0, busy: 0, readers: 100, T + 2));
+    }
+
+    [Fact]
+    public void ReadsAnsweredLateAndReadsWaitingLateAreJudgedTogether()
+    {
+        // 1 late of 150 answered is under 1 %; with 1 more among the 50 waiting, 2 of 200 is exactly 1 %: it stays
+        Loop.Tally tally = Answered(150, 1);
+        Assert.Equal(64, Loop.Judged(64, ref tally, waiting: 50, waitingLate: 1, busy: 2, readers: 100, T + 1));
+        // 3 of 200 is more
+        tally = Answered(150, 1);
+        Assert.Equal(32, Loop.Judged(64, ref tally, waiting: 50, waitingLate: 2, busy: 2, readers: 100, T + 1));
+        Assert.Equal((0, 0), (tally.Reads, tally.Late));
+    }
+
+    [Theory]
+    [InlineData(99, 0, false)]
+    [InlineData(60, 39, false)]
+    [InlineData(100, 0, true)]
+    [InlineData(60, 40, true)]
+    [InlineData(0, 100, true)]
+    public void FewerThanAHundredReadsAreTooFewToJudgeBy(int answered, int waiting, bool judged)
+    {
+        // every one of them late: a judgment would halve the batch
+        Loop.Tally tally = Answered(answered, answered);
+        int batch = Loop.Judged(64, ref tally, waiting, waitingLate: waiting, busy: 1, readers: 100, T + 1);
+        Assert.Equal(judged ? 32 : 64, batch);
+        // judged, the count starts over; not judged, it goes on
+        Assert.Equal(judged ? 0 : answered, tally.Reads);
+        Assert.Equal(judged ? 0 : answered, tally.Late);
+    }
+
+    [Fact]
+    public void AFewLateReadsOnAQuietLoopAreForgottenAfterTwoSecondsNotHeldAgainstLaterReads()
+    {
+        long forget = Ms(Loop.ForgetAfterMs);
+        // five late reads, and for two seconds too few others to judge by
+        Loop.Tally tally = Answered(5, 5);
+        Assert.Equal(64, Loop.Judged(64, ref tally, 0, 0, busy: 0, readers: 100, T + forget - 1));
+        Assert.Equal((5, 5, T), (tally.Reads, tally.Late, tally.Since)); // still remembered
+        Assert.Equal(64, Loop.Judged(64, ref tally, 0, 0, busy: 0, readers: 100, T + forget));
+        Assert.Equal((0, 0, T + forget), (tally.Reads, tally.Late, tally.Since)); // forgotten
+
+        // much later a hundred reads are answered at once: nothing is held against them
+        tally.Reads = 100;
+        Assert.Equal(64, Loop.Judged(32, ref tally, 0, 0, busy: 0, readers: 100, T + 50 * forget));
+
+        // had the five been remembered, 5 of 105 would have halved the batch
+        tally = Answered(105, 5);
+        Assert.Equal(16, Loop.Judged(32, ref tally, 0, 0, busy: 0, readers: 100, T + 50 * forget));
+    }
+
+    // ---- the order connections come back in
+
+    [Fact]
+    public void WritersReconnectBeforeReadersEachInItsOwnPlace()
+    {
+        // three readers, then two writers
+        Assert.Equal([2, 3, 4, 0, 1], Enumerable.Range(0, 5).Select(i => Loop.ReconnectRank(i, readers: 3, all: 5)));
+        Prop.ForAll((from readers in Gen.Choose(1, 500) from writers in Gen.Choose(1, 16) select (readers, writers)).ToArbitrary(), c =>
+        {
+            int all = c.readers + c.writers;
+            int[] ranks = [.. Enumerable.Range(0, all).Select(i => Loop.ReconnectRank(i, c.readers, all))];
+            // every place once, and every writer ahead of every reader
+            Assert.Equal(Enumerable.Range(0, all), ranks.Order());
+            Assert.True(ranks.Skip(c.readers).Max() < ranks.Take(c.readers).Min());
+        }).QuickCheckThrowOnFailure();
+    }
+
     // ---- how long the loop may wait
 
     [Fact]

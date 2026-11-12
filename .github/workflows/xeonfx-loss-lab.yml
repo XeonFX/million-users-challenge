@@ -67,7 +67,7 @@ jobs:
       matrix:
         include:
           # Postgres link loss % : client link loss %. "in" drops only what comes in to the server.
-          # new4 is this branch's build given the connections one loop has on a 4-core box (124 of the 496).
+          # new4 is this branch's build given the connections one loop has on a 4-core box (120 of the 480).
           - { conditions: "0:0 5:5 10:10 15:15 18:18 20:20", dir: in, cpus: "0", think: "0.25", users: 16000, builds: "base new4" }
           - { conditions: "5:5 10:10 12:12 15:15", dir: both, cpus: "0", think: "0.25", users: 16000, builds: "base new4" }
           # nearer a scoring loop's rate, as far as the runner's four cores carry Postgres and the load with it
@@ -114,7 +114,7 @@ jobs:
               text = open(path).read()
               assert text.count(old[1]) == 1, (name, path)
               open(path, "w").write(text.replace(old[1], new))
-          variant("new4", "new", ("Program.cs", "const int Connections = 496;"), "const int Connections = 124;")
+          variant("new4", "new", ("Program.cs", "const int Connections = 480;"), "const int Connections = 120;")
           PY
           for b in base new new4; do bash /tmp/v/$b/build.sh > /dev/null; done
       - name: runs
