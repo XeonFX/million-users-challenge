@@ -36,31 +36,17 @@ CRC-32.
   finds one free. So a commit that is slow, or whose packet was lost, holds up its own group and nothing behind it,
   and reads never wait for a commit. If a write fails (a like on a missing post), it gets its error and the rest
   of its group are sent again.
-- **Built for a network that loses packets.** Near its limit the scoring box's network drops packets, and what gives
-  way first is the rows coming from Postgres: failed runs on boxes like it (nish-std-amritk's) and runs with packets
-  dropped on purpose (below) both show reads taking seconds while writes still take 220 ms.
-  On a pipelined connection one lost packet holds up every read behind it. A packet with none after it (the last
-  of an exchange, or one that was lost again when it was resent) waits out a timer of 200 ms that doubles. And TCP
-  at Postgres's end shrinks the connection's window at every loss, so a few connections that carry everything stop
-  carrying it. This is what keeps the reads moving:
-  - *Nudges.* A connection that owes replies and has been silent for 5 ms (20 ms for a writer: a commit waits for
-    its WAL flush) gets a lone Sync, and another every 5 ms while it stays silent, four of them, then less often,
-    down to one every 80 ms. Each reaches Postgres past the hole, or its ReadyForQuery reaches the server past it,
-    and the side that sent the lost packet resends it at once, where the timer would take 200 ms. On a quiet
-    network none are sent, so it costs no packets there.
-  - *Readers by the hundred.* 480 connections in all, under the 512 of rule 5: 112 readers a loop on 4 cores, 56 on
-    8, 28 on 16. A quiet network uses eight a loop. Under loss a batch takes longer, more are out at once, and each
-    is on a reader of its own: a reader that has gone silent on what it owes is never given a batch while another
-    answers.
-  - *Smaller batches while it lasts.* When more than 1 % of the reads have waited 350 ms or more (through more than
-    one timer), the batch size halves, each quarter of a second, down to 4: more batches, each a shorter stream
-    with fewer packets to lose and fewer reads behind them. When fewer than 0.25 % have, it doubles again, back to
-    64, because fewer and fuller packets are what a healthy network wants. It also doubles while nine readers in
-    ten are busy: more batches need more readers.
-
-  No statement runs twice for this: a read is sent once, on one connection, and waits for it. A Sync is not a
-  query. Every socket also uses `TCP_THIN_LINEAR_TIMEOUTS` to limit timeout backoff for small amounts of data in
-  flight.
+- **Recovery on silent Postgres connections.** A quiet connection with a lost segment can wait for its
+  retransmission timeout. A Postgres connection that owes replies and has been silent for 50 ms gets a lone Sync,
+  with exponential backoff until data arrives. The extra traffic can trigger earlier loss detection. A writer
+  tracks each nudge separately, so its reply can never acknowledge another write group's commit. Every socket
+  also uses `TCP_THIN_LINEAR_TIMEOUTS` to limit timeout backoff for small amounts of data in flight.
+- **A free reader for every batch.** 480 connections in all, under the 512 of rule 5: 112 readers a loop on 4
+  cores, 56 on 8, 28 on 16. On a pipelined connection one lost packet holds up every read behind it, and TCP at
+  Postgres's end shrinks the connection's window at every loss, so a few connections that carry everything stop
+  carrying it when packets are lost. Here a batch never waits behind another: a reader that has gone silent on
+  what it owes is passed over, and the readers that take turns grow from eight to twice as many as are busy.
+  What this is worth depends on how the network fails; both cases are measured below.
 - **Fewer packets per client request.** Clients inherit their TCP options from the listener, with no call per
   connection: `TCP_NODELAY`, `TCP_THIN_LINEAR_TIMEOUTS`, `TCP_DEFER_ACCEPT` and delayed-ACK mode (`TCP_QUICKACK`
   off). With `TCP_DEFER_ACCEPT` a connection is handed over once its first request is in, and that request is read
@@ -84,39 +70,46 @@ Login to Postgres is SCRAM-SHA-256 (or trust). A dropped database connection fai
 
 Not the scoring box: GitHub's 4-core runners (Ubuntu 24.04), Postgres 18 in a container on a bridge, so the link has
 a TCP stack of its own at the far end, with 0.1 ms added each way and no segmentation offload; mload on loopback.
-Packets are dropped at random where they arrive. "In" drops that share of what Postgres sends the server and of what
-the clients send it, as a box whose receive side overflows would; "each way" drops it in both directions on both
-links. One loop with the connections a 4-core box gives it (112 readers, 8 writers), 16,000 users at
-`-think-scale 0.25` (6,200 requests/s), 15 s ramp, 60 s hold, a fresh database each run. p95 / p99 in ms; a run
-passes as the challenge's do (p95 under 500 ms, p99 under 1 s).
+One loop with the connections a 4-core box gives it (112 readers, 8 writers), `-think-scale 0.25`, 15 s ramp, 60 s
+hold, a fresh database each run. A run passes as the challenge's do (p95 under 500 ms, p99 under 1 s).
 
-| dropped | #114 (8 readers, nudges after 50 ms) | this |
+**Packets dropped at random**, where they arrive, at 16,000 users (6,200 requests/s). "In" drops that share of what
+Postgres sends the server and of what the clients send it; "each way" drops it in both directions on both links.
+p95 / p99 in ms.
+
+| dropped | #114 (8 readers a loop) | this |
 |---|---|---|
-| none | pass, 5 / 6 | pass, 5 / 6 |
-| 5 % in | pass, 214 / 234 | pass, 210 / 220 |
-| 10 % in | fail, 5,167 / 7,542 | pass, 218 / 425 |
-| 15 % in | fail | pass, 227 / 639 |
-| 18 % in | fail | pass, 425 / 845 |
-| 20 % in | fail | fail, 621 / 1,296 |
+| none | pass, 4 / 5 | pass, 4 / 5 |
+| 5 % in | pass, 214 / 232 | pass, 210 / 220 |
+| 10 % in | fail, 4,916 / 6,432 | pass, 223 / 438 |
+| 15 % in | fail | pass, 434 / 845 |
+| 18 % in | fail | fail, 627 / 1,139 |
 | 5 % each way | pass, 234 / 434 | pass, 216 / 417 |
-| 10 % each way | fail, 6,181 / 7,393 | pass, 325 / 713 |
-| 12 % each way | fail | fail, 429 / 1,041 |
-| 15 % each way | fail | fail, 621 / 1,712 |
+| 10 % each way | fail, 5,485 / 7,034 | pass, 413 / 812 |
+| 12 % each way | fail | fail, 484 / 1,150 |
 
-Where #114 fails, its reads take seconds and its likes still take about 240 ms. At 28,000 users on the one loop
-(10,800 requests/s) this passes 10 % in at 218 / 425 and 15 % in at 232 / 639, where #114 fails both. With four
-loops it passes 15 % in at 225 / 633, where #114 fails at 2,549 / 3,758.
+**Packets capped**: what comes in to the server past a rate is dropped, Postgres's replies and the clients' packets
+out of one bucket, so the entry's own packets and its retransmissions count against it. The most users held:
 
-On a quiet network it costs nothing: 4.46 packets a request against #114's 4.47 at this load, 4.36 against 4.36 at
-10,800 requests/s, 4.93 against 4.93 with four loops, and 8.21 against 8.26 at the scoring run's think time
-(`-think-scale 2.5`, where the clients' keep-alive probes and their answers are a third of the packets), with the
-same latency.
+| cap on incoming packets | #114 | this |
+|---|---|---|
+| 15,000 a second | 12,000 and 12,000 | 12,000 and 11,500 |
+| 24,000 a second | 20,000 | 19,000 |
+
+Under a cap this gains nothing and loses a step at the edge: with more connections out, a few more packets go
+with them when replies stall (5.4 a request against 4.95 at 12,000 users). The six entries that share the top of
+the board hold 12,000 under the first cap too, and 18,000 to 20,000 under the second, which is how the board itself
+looks. So the scoring box most likely behaves like the cap, and there this version is no better than #114.
+
+On a quiet network the two send the same packets: 4.46 a request each at this load, and 8.20 against 8.25 at the
+scoring run's think time (`-think-scale 2.5`, where the clients' keep-alive probes and their answers are a third of
+the packets).
 
 ## The code
 
 - `Program.cs` starts the loops; `Loop.cs` is the loop itself and its passes, `Loop.Http.cs` its clients
-  (accept, parse, respond), `Loop.Routes.cs` the routes, `Loop.Postgres.cs` the reads (which reader takes a batch,
-  how many reads it holds), write groups and database connections.
+  (accept, parse, respond), `Loop.Routes.cs` the routes, `Loop.Postgres.cs` the reads (which reader takes a
+  batch), write groups and database connections.
 - `Pg.cs` is one Postgres connection on the wire protocol, `Scram.cs` its login.
 - `Json.cs` writes the responses and reads a new post's body, `Gzip.cs` compresses the feed, `Jwt.cs` checks tokens,
   `Native.cs` holds the libc calls.
