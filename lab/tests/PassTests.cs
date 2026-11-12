@@ -9,16 +9,16 @@ using Xunit;
 
 namespace MillionUsers.Epoll.Tests;
 
-/// <summary>What a loop pass leaves on a Postgres connection: which reader takes its reads, when a connection that
-/// stays silent is nudged with a Sync, how the batch size follows the reads' waits, and how long the loop may wait
-/// for the next event.</summary>
+/// <summary>What a loop pass leaves on a Postgres connection: which reader takes its reads, how many readers take
+/// turns, when a connection that stays silent is nudged with a Sync, the order connections come back in, and how
+/// long the loop may wait for the next event.</summary>
 public sealed class PassTests
 {
     const long T = 1_000_000_000; // a Stopwatch timestamp well past 0
     /// <summary>50 ms in Stopwatch ticks (the waits of <see cref="Loop.WaitNanos"/> are checked against it).</summary>
     static readonly long N = Stopwatch.Frequency / 20;
-    /// <summary>The silence before a reader's and a writer's nudge, and before a reader counts as stalled.</summary>
-    static readonly long R = Ms(Pg.ReadNudgeAfterMs), W = Ms(Pg.WriteNudgeAfterMs), Stall = Ms(Pg.StallAfterMs);
+    /// <summary>The silence before a reader counts as stalled.</summary>
+    static readonly long Stall = Ms(Pg.StallAfterMs);
 
     static long Ms(long ms) => ms * Stopwatch.Frequency / 1000;
 
@@ -201,15 +201,19 @@ public sealed class PassTests
     // ---- what sealing a batch leaves
 
     [Fact]
-    public void SealingStampsEachReadOfTheBatchAndTheReaderWithTheTime()
+    public void SealingStampsTheReaderWithTheTimeOfItsLastBatch()
     {
         Pg pg = Reader();
+        Assert.Equal(0, pg.LastUsed);
         Reads(pg, 2);
+        Assert.Equal(0, pg.LastUsed); // an open batch hasn't been sent
         pg.Seal(T + 3);
+        Assert.Equal(T + 3, pg.LastUsed);
+        pg.Seal(T + 5); // nothing to seal
+        Assert.Equal(T + 3, pg.LastUsed);
         Reads(pg, 1);
         pg.Seal(T + 9);
         Assert.Equal(T + 9, pg.LastUsed);
-        Assert.Equal([T + 3, T + 3, T + 9], new[] { pg.TakeWaiter(), pg.TakeWaiter(), pg.TakeWaiter() }.Select(w => w.Sent));
     }
 
     /// <summary>Puts what Postgres sent into the connection's receive buffer, as its Receive does from the socket.</summary>
@@ -238,8 +242,8 @@ public sealed class PassTests
         Pg pg = Writer();
         pg.Group.Add(new WriteJob { Kind = WriteJob.Like, UserId = 7, PostId = 9 });
         pg.SendGroup(T);
-        pg.Nudge(T + W);
-        pg.Nudge(T + 2 * W); // the group's Sync and two nudges: three ReadyForQuerys are owed
+        pg.Nudge(T + N);
+        pg.Nudge(T + 3 * N); // the group's Sync and two nudges: three ReadyForQuerys are owed
 
         Arrives(pg, Bound, Inserted, Ready);
         Assert.True(pg.NextReply(out ReadOnlySpan<byte> reply, out bool group));
@@ -250,8 +254,8 @@ public sealed class PassTests
 
         // the next group leaves before the nudges' answers are in, and is nudged once itself
         pg.Group.Add(new WriteJob { Kind = WriteJob.Like, UserId = 8, PostId = 9 });
-        pg.SendGroup(T + 3 * W);
-        pg.Nudge(T + 4 * W);
+        pg.SendGroup(T + 4 * N);
+        pg.Nudge(T + 5 * N);
         Arrives(pg, Ready);
         Assert.True(pg.NextReply(out _, out group));
         Assert.False(group); // the first nudge
@@ -284,63 +288,41 @@ public sealed class PassTests
     }
 
     [Fact]
-    public void ASilentReaderIsNudgedAfter5MsWithOneSync()
+    public void ASilentReaderIsNudgedAfter50MsWithOneSync()
     {
         Pg pg = Reader();
         Reads(pg, 2);
         pg.Seal(T);
         Assert.True(pg.Owes);
+        Assert.Equal("BEBES", Types(pg.Unsent));
 
-        Assert.Equal(T + R, pg.Nudge(T));
-        Assert.Equal(T + R, pg.Nudge(T + R - 1));
+        Assert.Equal(T + N, pg.Nudge(T));
+        Assert.Equal(T + N, pg.Nudge(T + N - 1));
         Assert.Equal("BEBES", Types(pg.Unsent)); // not yet
 
-        long next = pg.Nudge(T + R);
+        long next = pg.Nudge(T + N);
         Assert.Equal("BEBESS", Types(pg.Unsent));
         Assert.True(pg.WantsWrite);
-        Assert.Equal(T + 2 * R, next);
+        Assert.Equal(T + N + 2 * N, next);
         // the reads are still waiting, in order
         Assert.Equal(2, pg.Pending);
     }
 
     [Fact]
-    public void FourNudgesComeAtTheSameIntervalThenItDoublesUpTo80Ms()
+    public void EachNudgeWaitsTwiceAsLongAsTheLast()
     {
         Pg pg = Reader();
         Reads(pg, 1);
         pg.Seal(T);
-        // the gaps after the 1st, 2nd, ... nudge, in milliseconds
-        long[] gaps = [5, 5, 5, 10, 20, 40, 80, 80, 80];
-        long now = T + R;
-        foreach (long gap in gaps)
+        long now = T, gap = N;
+        for (int k = 0; k < 6; k++)
         {
-            Assert.Equal(now, pg.Nudge(now - 1)); // not before it is due
-            Assert.Equal(now + Ms(gap), pg.Nudge(now));
-            now += Ms(gap);
+            now += gap;
+            Assert.Equal(now, pg.Nudge(now - 1));
+            Assert.Equal(now + 2 * gap, pg.Nudge(now));
+            gap *= 2;
         }
-        Assert.Equal("BES" + new string('S', gaps.Length), Types(pg.Unsent));
-    }
-
-    [Fact]
-    public void AWriterIsGiven20MsAndItsNudgesBackOffTo80MsToo()
-    {
-        Pg pg = Writer();
-        Assert.Equal(long.MaxValue, pg.Nudge(T + 10 * N));
-        pg.Group.Add(new WriteJob { Kind = WriteJob.Like, UserId = 7, PostId = 9 });
-        pg.Group.Add(new WriteJob { Kind = WriteJob.Create, UserId = 7, BodyLength = 0 });
-        pg.SendGroup(T);
-        Assert.True(pg.Owes);
-        Assert.Equal(T + W, pg.Nudge(T + R)); // a reader's time is too soon for a commit
-        Assert.Equal("BEBES", Types(pg.Unsent));
-
-        long[] gaps = [20, 20, 20, 40, 80, 80];
-        long now = T + W;
-        foreach (long gap in gaps)
-        {
-            Assert.Equal(now + Ms(gap), pg.Nudge(now));
-            now += Ms(gap);
-        }
-        Assert.Equal("BEBES" + new string('S', gaps.Length), Types(pg.Unsent));
+        Assert.Equal("BES" + new string('S', 6), Types(pg.Unsent));
     }
 
     [Fact]
@@ -349,8 +331,20 @@ public sealed class PassTests
         Pg pg = Reader();
         Reads(pg, 1);
         pg.Seal(T);
-        // the loop looked late: the next nudge is due an interval after this one, not after its deadline
-        Assert.Equal(T + 9 * R + R, pg.Nudge(T + 9 * R));
+        // the loop looked late: the next nudge is due 2 N after this one, not after its deadline
+        Assert.Equal(T + 5 * N + 2 * N, pg.Nudge(T + 5 * N));
+    }
+
+    [Fact]
+    public void ANudgeDoesNotCountAsHearingFromPostgres()
+    {
+        Pg pg = Reader();
+        Reads(pg, 1);
+        pg.Seal(T);
+        pg.Nudge(T + N);
+        // silent since the batch left, however many Syncs went after it: the reader is still passed over
+        Assert.Equal(N + 7, pg.SilentFor(T + N + 7));
+        Assert.True(pg.Stalled(T + N + 7));
     }
 
     [Fact]
@@ -360,12 +354,12 @@ public sealed class PassTests
         Reads(pg, 1);
         pg.Seal(T);
         Reads(pg, 1);
-        pg.Seal(T + R / 2);
-        Assert.Equal(T + R, pg.Nudge(T + R / 2));
-        pg.Nudge(T + R);
+        pg.Seal(T + N / 2);
+        Assert.Equal(T + N, pg.Nudge(T + N / 2));
+        pg.Nudge(T + N);
         Assert.Equal("BESBESS", Types(pg.Unsent));
         // and the reader has been silent since the first batch, not the second
-        Assert.Equal(R, pg.SilentFor(T + R));
+        Assert.Equal(N, pg.SilentFor(T + N));
     }
 
     [Fact]
@@ -380,7 +374,7 @@ public sealed class PassTests
 
         Reads(pg, 1);
         pg.Seal(T + 200 * N);
-        Assert.Equal(T + 200 * N + R, pg.Nudge(T + 200 * N));
+        Assert.Equal(T + 200 * N + N, pg.Nudge(T + 200 * N));
     }
 
     [Fact]
@@ -395,27 +389,39 @@ public sealed class PassTests
     }
 
     [Fact]
-    public void ClosingForgetsTheNudgesAndWhatWasOwed()
+    public void ClosingForgetsTheBackoffAndWhatWasOwed()
     {
         Pg pg = Reader();
         Reads(pg, 1);
         pg.Seal(T);
-        for (int k = 1; k <= 6; k++) pg.Nudge(T + k * N); // well into the doubled intervals
+        pg.Nudge(T + N);
+        pg.Nudge(T + 3 * N);
         pg.Close();
         Assert.True(pg.Unsent.IsEmpty);
         Take(pg, 1); // the loop fails what it owed
         pg.Broken = false; // reconnected
         Reads(pg, 1);
         pg.Seal(T + 100 * N);
-        Assert.Equal("BES", Types(pg.Unsent));
-        Assert.Equal(T + 100 * N + R, pg.Nudge(T + 100 * N));
-        // the first nudges are at the short interval again
-        Assert.Equal(T + 100 * N + 2 * R, pg.Nudge(T + 100 * N + R));
+        Assert.Equal(T + 100 * N + N, pg.Nudge(T + 100 * N));
+    }
+
+    [Fact]
+    public void ASilentWriterIsNudgedBehindItsGroup()
+    {
+        Pg pg = Writer();
+        Assert.Equal(long.MaxValue, pg.Nudge(T + 10 * N));
+        pg.Group.Add(new WriteJob { Kind = WriteJob.Like, UserId = 7, PostId = 9 });
+        pg.Group.Add(new WriteJob { Kind = WriteJob.Create, UserId = 7, BodyLength = 0 });
+        pg.SendGroup(T);
+        Assert.True(pg.Owes);
+        Assert.Equal("BEBES", Types(pg.Unsent));
+        Assert.Equal(T + N, pg.Nudge(T + N - 1));
+        Assert.Equal(T + 3 * N, pg.Nudge(T + N));
+        Assert.Equal("BEBESS", Types(pg.Unsent));
     }
 
     /// <summary>Whatever a connection is asked to do, what it has queued is whole messages, with one Sync per sealed
-    /// batch and one per nudge; it is nudged only while it owes something and has been silent long enough, and never
-    /// later than the cap after the last one.</summary>
+    /// batch and one per nudge, and it is nudged only while it owes something and has been silent long enough.</summary>
     [Fact]
     public void WhateverHappensTheWireHoldsWholeMessagesAndOneSyncPerBatchAndNudge()
     {
@@ -459,7 +465,6 @@ public sealed class PassTests
                         Assert.Equal(owed, due != long.MaxValue);
                         if (!owed) Assert.False(nudged);
                         if (owed) Assert.True(due > now, "a nudge that is due is sent, and the next one is later");
-                        if (owed) Assert.True(due - now <= Ms(Pg.NudgeCapMs), "nudges are never further apart than the cap");
                         break;
                 }
                 Assert.Equal(sent - answered > 0, pg.Owes);
@@ -471,131 +476,37 @@ public sealed class PassTests
         }).QuickCheckThrowOnFailure();
     }
 
-    // ---- how many reads a batch holds
+    // ---- how many readers take turns
 
     [Theory]
-    [InlineData(64, 100, 0, 64)]   // nothing waited long: already the largest
-    [InlineData(32, 100, 0, 64)]   // grows back by doubling
-    [InlineData(4, 100, 0, 8)]
-    [InlineData(64, 100, 1, 64)]   // exactly 1 %: not more than 1 %, and not fewer than 0.25 %
-    [InlineData(64, 100, 2, 32)]   // more than 1 %: halved
-    [InlineData(64, 199, 2, 32)]
-    [InlineData(64, 200, 2, 64)]   // 1 % again
-    [InlineData(8, 100, 100, 4)]
-    [InlineData(4, 100, 100, 4)]   // never below the smallest
-    [InlineData(6, 100, 100, 4)]
-    [InlineData(32, 400, 1, 32)]   // exactly 0.25 %: stays
-    [InlineData(32, 401, 1, 64)]   // fewer than 0.25 %: doubles
-    [InlineData(48, 1000, 0, 64)]  // never above the largest
-    [InlineData(16, int.MaxValue, int.MaxValue / 50, 8)] // no overflow in the shares
-    [InlineData(16, int.MaxValue, 0, 32)]
-    public void ABatchHalvesWhenMoreThanOneInAHundredReadsWaitedLongAndDoublesWhenFewerThanOneInFourHundredDid(int batch, int reads, int late, int next)
+    [InlineData(0, 8)]    // a quiet loop: the fewest
+    [InlineData(1, 8)]
+    [InlineData(2, 8)]
+    [InlineData(3, 10)]   // from here, twice the busy ones and four more
+    [InlineData(10, 24)]
+    [InlineData(112, 228)] // more than there are: NextReader takes it as all of them
+    public void TwiceAsManyReadersTakeTurnsAsWereBusyLatelyAndFourMoreEightAtLeast(int busyPeak, int turns)
     {
-        Assert.Equal(next, Loop.NextBatch(batch, reads, late, busy: 1, readers: 100));
-    }
-
-    [Theory]
-    [InlineData(8, 89, 100, 4)]     // readers to spare: the late reads halve it
-    [InlineData(8, 90, 100, 16)]    // nine in ten busy: no reader for more batches, so larger ones
-    [InlineData(8, 100, 100, 16)]
-    [InlineData(64, 100, 100, 64)]  // already the largest
-    [InlineData(8, 8, 9, 4)]        // 8 of 9 is short of nine in ten
-    [InlineData(8, 9, 10, 16)]
-    [InlineData(8, 1, 1, 16)]       // a loop's only reader, busy
-    [InlineData(8, 0, 1, 4)]
-    [InlineData(8, int.MaxValue, int.MaxValue, 16)] // no overflow
-    public void ABatchGrowsWhileNineReadersInTenAreBusyHoweverLongTheReadsWait(int batch, int busy, int readers, int next)
-    {
-        Assert.Equal(next, Loop.NextBatch(batch, reads: 1000, late: 1000, busy, readers));
+        Assert.Equal(turns, Loop.Turns(busyPeak));
     }
 
     [Fact]
-    public void TheBatchSizeStaysBetweenTheSmallestAndTheLargestAndMovesOneStepAtATime()
+    public void TheBusyPeakFollowsABurstAtOnceAndFadesByAQuarterEachCountAfterIt()
     {
-        var judgments = from batch in Gen.Elements(4, 8, 16, 32, 64)
-                        from reads in Gen.Choose(100, 100_000)
-                        from late in Gen.Choose(0, 100_000)
-                        from readers in Gen.Choose(1, 500)
-                        from busy in Gen.Choose(0, 500)
-                        select (batch, reads, late: Math.Min(late, reads), busy: Math.Min(busy, readers), readers);
-        Prop.ForAll(judgments.ToArbitrary(), j =>
+        Assert.Equal(40, Loop.Peak(40, 0));    // up at once
+        Assert.Equal(40, Loop.Peak(40, 12));
+        Assert.Equal(30, Loop.Peak(2, 40));    // then three quarters of the peak, while that is more than now
+        Assert.Equal(22, Loop.Peak(2, 30));
+        Assert.Equal(16, Loop.Peak(16, 20));   // or the count now
+        Assert.Equal(0, Loop.Peak(0, 1));      // and down to nothing
+        // a burst of 40 busy readers on a loop that then has 2: the turns are back at the fewest within ten counts
+        int peak = 40, counts = 0;
+        while (Loop.Turns(peak) > Loop.FewestTurns)
         {
-            int next = Loop.NextBatch(j.batch, j.reads, j.late, j.busy, j.readers);
-            Assert.InRange(next, Loop.SmallestBatch, Pg.MaxBatch);
-            Assert.Contains(next, new[] { j.batch / 2, j.batch, j.batch * 2 });
-            // with readers to spare, more late reads never give a larger batch
-            if (j.busy * 10 < j.readers * 9)
-                Assert.True(Loop.NextBatch(j.batch, j.reads, Math.Min(j.reads, j.late + j.reads / 50 + 1), j.busy, j.readers) <= next);
-            // and more busy readers never give a smaller one
-            Assert.True(Loop.NextBatch(j.batch, j.reads, j.late, j.readers, j.readers) >= next);
-        }).QuickCheckThrowOnFailure();
-    }
-
-    // ---- judging the batch size by how the reads fare
-
-    static Loop.Tally Answered(int reads, int late, long since = T) => new() { Reads = reads, Late = late, Since = since };
-
-    [Fact]
-    public void ReadsStillWaitingCountInOneJudgmentAndAreNotCarriedIntoTheNext()
-    {
-        // 200 reads wait on silent readers: they halve the batch now
-        Loop.Tally tally = Answered(0, 0);
-        Assert.Equal(32, Loop.Judged(64, ref tally, waiting: 200, waitingLate: 200, busy: 4, readers: 100, T + 1));
-        Assert.Equal((0, 0, T + 1), (tally.Reads, tally.Late, tally.Since));
-
-        // the next quarter second 400 reads are answered at once and none waits: the batch grows back. Had the 200
-        // been kept in the count, a third of the reads would still look late and it would halve again
-        tally.Reads = 400;
-        Assert.Equal(64, Loop.Judged(32, ref tally, waiting: 0, waitingLate: 0, busy: 0, readers: 100, T + 2));
-    }
-
-    [Fact]
-    public void ReadsAnsweredLateAndReadsWaitingLateAreJudgedTogether()
-    {
-        // 1 late of 150 answered is under 1 %; with 1 more among the 50 waiting, 2 of 200 is exactly 1 %: it stays
-        Loop.Tally tally = Answered(150, 1);
-        Assert.Equal(64, Loop.Judged(64, ref tally, waiting: 50, waitingLate: 1, busy: 2, readers: 100, T + 1));
-        // 3 of 200 is more
-        tally = Answered(150, 1);
-        Assert.Equal(32, Loop.Judged(64, ref tally, waiting: 50, waitingLate: 2, busy: 2, readers: 100, T + 1));
-        Assert.Equal((0, 0), (tally.Reads, tally.Late));
-    }
-
-    [Theory]
-    [InlineData(99, 0, false)]
-    [InlineData(60, 39, false)]
-    [InlineData(100, 0, true)]
-    [InlineData(60, 40, true)]
-    [InlineData(0, 100, true)]
-    public void FewerThanAHundredReadsAreTooFewToJudgeBy(int answered, int waiting, bool judged)
-    {
-        // every one of them late: a judgment would halve the batch
-        Loop.Tally tally = Answered(answered, answered);
-        int batch = Loop.Judged(64, ref tally, waiting, waitingLate: waiting, busy: 1, readers: 100, T + 1);
-        Assert.Equal(judged ? 32 : 64, batch);
-        // judged, the count starts over; not judged, it goes on
-        Assert.Equal(judged ? 0 : answered, tally.Reads);
-        Assert.Equal(judged ? 0 : answered, tally.Late);
-    }
-
-    [Fact]
-    public void AFewLateReadsOnAQuietLoopAreForgottenAfterTwoSecondsNotHeldAgainstLaterReads()
-    {
-        long forget = Ms(Loop.ForgetAfterMs);
-        // five late reads, and for two seconds too few others to judge by
-        Loop.Tally tally = Answered(5, 5);
-        Assert.Equal(64, Loop.Judged(64, ref tally, 0, 0, busy: 0, readers: 100, T + forget - 1));
-        Assert.Equal((5, 5, T), (tally.Reads, tally.Late, tally.Since)); // still remembered
-        Assert.Equal(64, Loop.Judged(64, ref tally, 0, 0, busy: 0, readers: 100, T + forget));
-        Assert.Equal((0, 0, T + forget), (tally.Reads, tally.Late, tally.Since)); // forgotten
-
-        // much later a hundred reads are answered at once: nothing is held against them
-        tally.Reads = 100;
-        Assert.Equal(64, Loop.Judged(32, ref tally, 0, 0, busy: 0, readers: 100, T + 50 * forget));
-
-        // had the five been remembered, 5 of 105 would have halved the batch
-        tally = Answered(105, 5);
-        Assert.Equal(16, Loop.Judged(32, ref tally, 0, 0, busy: 0, readers: 100, T + 50 * forget));
+            peak = Loop.Peak(2, peak);
+            counts++;
+        }
+        Assert.InRange(counts, 5, 10);
     }
 
     // ---- the order connections come back in

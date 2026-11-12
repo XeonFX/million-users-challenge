@@ -145,7 +145,7 @@ sealed unsafe partial class Loop
         _passReader?.Seal(_now);
         _passReader = null;
         StartWriteGroups();
-        Judge();
+        CountBusy();
         long due = long.MaxValue;
         bool broken = false;
         for (int i = 0; i < _pgs.Length; i++)

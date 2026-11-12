@@ -14,10 +14,10 @@ int[] ports = [Port("PORT", 3000), Port("EXTRA_PORT", 3001)];
 // lost the same way, 1,350,000 against 1,510,000).
 int loops = Environment.ProcessorCount;
 // Most of Postgres's 512 connections, though a quiet network needs few: a pass's reads go out as one batch on one
-// reader, and a handful of readers taking turns carry every pass. They are there for when packets are lost. A
+// reader, and a handful of readers taking turns carry every pass. The rest are there for when packets are lost. A
 // connection that keeps losing packets carries little (TCP at Postgres's end shrinks its window and waits out
-// timers), and what it does carry holds up the reads queued behind it, so the reads then go out in more and smaller
-// batches, each on a reader of its own, and how many requests a loop can serve is how many readers it has.
+// timers), and what it does carry holds up the reads queued behind it. With a reader free for every batch, a batch
+// waits behind nothing but its own packets, and how many batches a loop can have out is how many readers it has.
 // Writers carry one group commit at a time. 480 in all at 4, 8 and 16 vCPUs: 112 readers and 8 writers a loop on 4.
 const int Connections = 480;
 loops = Math.Min(loops, Connections / 2); // a loop needs a reader and a writer

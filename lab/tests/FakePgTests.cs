@@ -418,11 +418,11 @@ public sealed class FakePgTests : IDisposable
     }
 
     [Fact]
-    public void AReaderThatStaysSilentIsNudgedEvery5MsThenLessOftenAndNewReadsGoToAnother()
+    public void AReaderThatStaysSilentIsNudgedAndNewReadsGoToAnother()
     {
         Client[] clients = HeldClients(3);
         clients[0].Send(Client.Request("GET", "/posts/11"));
-        FakeConn silent = _pg.WaitFor(l => l.StartsWith("pS", StringComparison.Ordinal), what: "the first read");
+        FakeConn silent = _pg.WaitFor(l => l == "pS", what: "the first read");
 
         // a read that comes while the first reader owes its reply goes to another reader
         Thread.Sleep(10);
@@ -432,50 +432,41 @@ public sealed class FakePgTests : IDisposable
         Assert.Equal(1, other.Answer());
         Assert.Equal(22, clients[1].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
 
-        // after 5 ms of silence a lone Sync, and another 5 ms later
-        _pg.WaitFor(_ => silent.Log.Length >= 4, 1000, "two nudges");
-        Assert.StartsWith("pSSS", silent.Log, StringComparison.Ordinal);
-        Assert.InRange(silent.TimeOf(2) - silent.TimeOf(1), 4, 60);
-        Assert.InRange(silent.TimeOf(3) - silent.TimeOf(2), 3, 60);
-        // then they back off to one every 80 ms: about ten in the first 400 ms, where one every 5 ms would be 80
-        Thread.Sleep(400);
-        Assert.InRange(Count(silent.Log, 'S') - 1, 6, 20);
+        // 50 ms of silence, then a lone Sync; 100 ms more, then another
+        _pg.WaitFor(_ => silent.Log == "pSS", 1000, "the first nudge");
+        double first = silent.TimeOf(2) - silent.TimeOf(1);
+        Assert.InRange(first, 45, 150);
+        _pg.WaitFor(_ => silent.Log == "pSSS", 1000, "the second nudge");
+        double second = silent.TimeOf(3) - silent.TimeOf(2);
+        Assert.InRange(second, 95, 250);
         Assert.False(clients[0].Hears(0));
 
-        // the reply and every other ReadyForQuery arrive: the read is answered, once, and the reader works on
-        Assert.InRange(silent.Answer(int.MaxValue), 7, 30);
+        // the reply and the nudges' ReadyForQuerys arrive: the read is answered, once, and the reader works on
+        Assert.Equal(3, silent.Answer(3));
         Assert.Equal(11, clients[0].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
         Assert.False(clients[0].Hears(50));
         _pg.Clear();
         clients[2].Send(Client.Request("GET", "/posts/33"));
-        _pg.WaitFor(l => l.StartsWith("pS", StringComparison.Ordinal)).Answer();
+        _pg.WaitFor(l => l == "pS").Answer();
         Assert.Equal(33, clients[2].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
     }
 
     [Fact]
-    public void WhileReadsWaitThroughRetransmitTimersNewBatchesAreSmallerAndOnMoreReaders()
+    public void WhileReadersStayBusyEveryNewBatchStillFindsAFreeOne()
     {
-        Client[] clients = HeldClients(150);
-        // 110 reads whose answers don't come: after 350 ms they count as waiting through timers, and each quarter of
-        // a second from then the batch size halves
-        for (int i = 0; i < 110; i++) clients[i].Send(Client.Request("GET", "/posts/" + (i + 1)));
-        _pg.WaitFor(_ => _pg.Conns.Sum(c => Count(c.Log, 'p')) == 110, what: "the 110 reads");
-        Assert.All(_pg.Conns, c => Assert.All(Batches(c.Log), batch => Assert.InRange(batch.Length, 1, 64)));
-        Assert.Contains(_pg.Conns, c => Batches(c.Log).Any(batch => batch.Length > 16));
-        Thread.Sleep(1300);
-
-        _pg.Clear();
-        for (int i = 110; i < 150; i++) clients[i].Send(Client.Request("GET", "/posts/" + (i + 1)));
-        _pg.WaitFor(_ => _pg.Conns.Sum(c => Count(c.Log, 'p')) == 40, what: "the 40 reads after");
-        string[][] after = [.. _pg.Conns.Select(c => Batches(c.Log)).Where(b => b.Length > 0)];
-        // 64 at first; halved at least twice by now, so 40 reads no longer fit one or two batches
-        Assert.All(after, batches => Assert.All(batches, batch => Assert.InRange(batch.Length, 1, 16)));
-        Assert.True(after.Length >= 3, $"{after.Length} readers took the 40 reads");
-        // each on a reader with nothing else waiting: none behind the stalled ones
-        Assert.All(after, batches => Assert.Single(batches));
+        Client[] clients = HeldClients(60);
+        // forty reads one after another, none answered: each is a batch, and each goes to a reader with nothing
+        // waiting, well past the eight that take turns on a quiet loop
+        for (int i = 0; i < 40; i++)
+        {
+            clients[i].Send(Client.Request("GET", "/posts/" + (i + 1)));
+            _pg.WaitFor(_ => _pg.Conns.Sum(c => Count(c.Log, 'p')) == i + 1, what: $"read {i + 1}");
+        }
+        Assert.Equal(40, _pg.Conns.Count(c => Batches(c.Log).Length == 1));
+        Assert.DoesNotContain(_pg.Conns, c => Batches(c.Log).Length > 1);
 
         foreach (FakeConn c in _pg.Conns) c.Answer(int.MaxValue);
-        for (int i = 110; i < 150; i++)
+        for (int i = 0; i < 40; i++)
             Assert.Equal(i + 1, clients[i].Read().Json.GetProperty("post").GetProperty("id").GetInt64());
     }
 
@@ -507,9 +498,7 @@ public sealed class FakePgTests : IDisposable
         Client[] clients = HeldClients(2);
         clients[0].Send(Like(1));
         FakeConn writer = _pg.WaitFor(l => l.StartsWith("lS", StringComparison.Ordinal), what: "the like");
-        // after 20 ms of silence, a nudge: a commit is given longer than a read
         _pg.WaitFor(_ => writer.Log.StartsWith("lSS", StringComparison.Ordinal), 1000, "the nudge");
-        Assert.InRange(writer.TimeOf(2) - writer.TimeOf(1), 15, 120);
 
         // the commit's answer arrives; the nudge's doesn't yet
         Assert.Equal(1, writer.Answer());

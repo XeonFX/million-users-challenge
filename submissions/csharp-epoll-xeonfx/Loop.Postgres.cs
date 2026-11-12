@@ -3,19 +3,19 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 
 /// <summary>The loop's Postgres side: each pass's reads sent as one batch on a reader and its writes as one group on a
-/// writer, replies turned into responses, and connections that drop or reconnect. Which reader takes a batch and how
-/// many reads a batch holds follow how the network is doing (<see cref="NextReader"/>, <see cref="Judge"/>).</summary>
+/// writer, replies turned into responses, and connections that drop or reconnect. Which reader takes a batch follows
+/// how the readers are doing (<see cref="NextReader"/>).</summary>
 sealed partial class Loop
 {
     // ---- reads
 
     /// <summary>Queues a read in this pass's batch. A pass's reads go to one reader, under one Sync, so they cost one
-    /// packet each way and one wake-up of one Postgres backend; past <see cref="_batch"/> reads the next reader takes
+    /// packet each way and one wake-up of one Postgres backend; past <see cref="Pg.MaxBatch"/> the next reader takes
     /// over.</summary>
     void QueueRead(int fd, byte statement, long id)
     {
         Pg? pg = _passReader;
-        if (pg == null || pg.Broken || pg.Open >= _batch)
+        if (pg == null || pg.Broken || pg.Open >= Pg.MaxBatch)
         {
             if (pg != null && !pg.Broken) pg.Seal(_now);
             pg = _passReader = NextReader(_pgs, _readers, _now, _turns);
@@ -67,88 +67,38 @@ sealed partial class Loop
         return best;
     }
 
-    // ---- how many reads a batch holds, and how many readers take turns
+    // ---- how many readers take turns
 
-    /// <summary>The least a batch shrinks to (<see cref="Judge"/>).</summary>
-    internal const int SmallestBatch = 4;
     /// <summary>The fewest readers that take turns.</summary>
     internal const int FewestTurns = 8;
-    /// <summary>A read that waited this long for Postgres waited through more than one retransmit timer.</summary>
-    internal const int LongWaitMs = 350;
-    /// <summary>How often the batch size is judged.</summary>
-    const int JudgeEveryMs = 250;
-    /// <summary>The fewest reads a judgment is made on.</summary>
-    internal const int JudgeReads = 100;
-    /// <summary>How long reads too few to judge by are remembered.</summary>
-    internal const int ForgetAfterMs = 2000;
-    static readonly long LongWait = Pg.Ticks(LongWaitMs), JudgeEvery = Pg.Ticks(JudgeEveryMs), ForgetAfter = Pg.Ticks(ForgetAfterMs);
+    static readonly long CountEvery = Pg.Ticks(250);
 
-    /// <summary>The reads answered since the last judgment, how many of them waited long, and when the count
-    /// began (a Stopwatch timestamp).</summary>
-    internal struct Tally
-    {
-        public int Reads, Late;
-        public long Since;
-    }
-
-    /// <summary>The most reads a batch holds now, <see cref="SmallestBatch"/> to <see cref="Pg.MaxBatch"/>. A batch's
-    /// rows come back as one stream, so a lost packet holds up every read behind it, and the longer the stream, the
-    /// likelier one of its packets is lost twice. While reads wait through retransmit timers, batches are halved:
-    /// more of them, on more readers, each less exposed. Once they stop, batches grow back, because fewer and
-    /// fuller packets are what a healthy network wants; and they grow whenever nearly every reader is busy, because
-    /// a small batch behind another on a busy reader is worse off than a large one on its own.</summary>
-    int _batch = Pg.MaxBatch;
-    /// <summary>How many readers take turns: twice as many as were busy lately, <see cref="FewestTurns"/> at least.
-    /// On a quiet network a few carry every pass and Postgres keeps as few backends warm; under loss, batches take
-    /// longer, more are out at once, and the turns widen with them.</summary>
+    /// <summary>How many readers take turns: twice as many as were busy lately and four more,
+    /// <see cref="FewestTurns"/> at least. On a quiet network a few carry every pass and Postgres keeps as few
+    /// backends warm; when batches take longer (packets are lost), more are out at once and the turns widen with
+    /// them, so a batch still finds a reader with nothing waiting.</summary>
     int _turns = FewestTurns;
-    long _judgedAt;
-    Tally _tally;
+    long _countedAt;
     int _busyPeak;
 
-    /// <summary>Every quarter of a second: sets how many readers take turns, and the batch size
-    /// (<see cref="Judged"/>).</summary>
-    void Judge()
+    /// <summary>Every quarter of a second: counts the busy readers and sets how many take turns.</summary>
+    void CountBusy()
     {
-        if (_now - _judgedAt < JudgeEvery) return;
-        _judgedAt = _now;
-        int busy = 0, waiting = 0, waitingLate = 0;
+        if (_now - _countedAt < CountEvery) return;
+        _countedAt = _now;
+        int busy = 0;
         for (int i = 0; i < _readers; i++)
-        {
-            Pg c = _pgs[i];
-            if (c.Broken || c.Pending == 0) continue;
-            busy++;
-            waiting += c.Pending;
-            if (c.SilentFor(_now) >= LongWait) waitingLate += c.Pending;
-        }
-        _busyPeak = Math.Max(busy, _busyPeak * 3 / 4);
-        _turns = Math.Max(FewestTurns, 2 * _busyPeak + 4);
-        _batch = Judged(_batch, ref _tally, waiting, waitingLate, busy, _readers, _now);
+            if (!_pgs[i].Broken && _pgs[i].Pending > 0) busy++;
+        _busyPeak = Peak(busy, _busyPeak);
+        _turns = Turns(_busyPeak);
     }
 
-    /// <summary>The batch size after a look at how the reads fare: those answered since the last judgment
-    /// (<paramref name="tally"/>) and those still waiting now, of which the ones on a reader silent for
-    /// <see cref="LongWaitMs"/> count as late. The waiting ones count in this judgment only; each is counted once
-    /// more, when its reply comes, and is late then if it waited that long since its batch was sealed. Fewer than
-    /// <see cref="JudgeReads"/> in all is too few to judge by: the batch stays as it is, and what those few showed is
-    /// forgotten after <see cref="ForgetAfterMs"/> rather than held against reads that come much later.</summary>
-    internal static int Judged(int batch, ref Tally tally, int waiting, int waitingLate, int busy, int readers, long now)
-    {
-        if (tally.Reads + waiting >= JudgeReads) batch = NextBatch(batch, tally.Reads + waiting, tally.Late + waitingLate, busy, readers);
-        else if (now - tally.Since < ForgetAfter) return batch;
-        tally = new Tally { Since = now };
-        return batch;
-    }
+    /// <summary>The most readers busy lately: the count now, or three quarters of the peak before when that is
+    /// more, so a burst is remembered for a second or so and then forgotten.</summary>
+    internal static int Peak(int busy, int peak) => Math.Max(busy, peak * 3 / 4);
 
-    /// <summary>The batch size after a judgment: double when nine readers in ten are busy (there is no reader left
-    /// for more batches) or fewer than 0.25 % of the reads waited long, half when more than 1 % did, within
-    /// <see cref="SmallestBatch"/> and <see cref="Pg.MaxBatch"/>.</summary>
-    internal static int NextBatch(int batch, int reads, int late, int busy, int readers)
-    {
-        if (busy * 10L >= readers * 9L || late * 400L < reads) return Math.Min(batch * 2, Pg.MaxBatch);
-        if (late * 100L > reads) return Math.Max(batch / 2, SmallestBatch);
-        return batch;
-    }
+    /// <summary>How many readers take turns when <paramref name="busyPeak"/> were busy lately.</summary>
+    internal static int Turns(int busyPeak) => Math.Max(FewestTurns, 2 * busyPeak + 4);
 
     /// <summary>A read failed inside a batch: Postgres skipped the reads after it up to the Sync, so they go again,
     /// with this pass's reads.</summary>
@@ -396,8 +346,6 @@ sealed partial class Loop
             {
                 if (end == 'Z' || pg.Pending == 0) continue;
                 Waiter w = pg.TakeWaiter();
-                _tally.Reads++;
-                if (_now - w.Sent >= LongWait) _tally.Late++;
                 if (end == 'E') RetryRestOfBatch(pg, w);
                 if (Conns[w.Fd].Gen != w.Gen) continue;
                 Conns[w.Fd].Busy = false;

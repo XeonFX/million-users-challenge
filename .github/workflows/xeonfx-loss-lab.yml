@@ -200,7 +200,7 @@ jobs:
   # rate is dropped, and how it does with packets dropped at random. A commit message with [staircase] runs it.
   staircase:
     name: "users held: ${{ matrix.name }}"
-    if: ${{ contains(github.event.head_commit.message, '[staircase]') }}
+    if: ${{ contains(github.event.head_commit.message, '[staircase]') || contains(github.event.head_commit.message, '[final]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -208,11 +208,7 @@ jobs:
       matrix:
         include:
           - { name: scored, variant: "" }
-          - { name: pr, variant: "four" }
-          - { name: wide, variant: "four+steady+calm" }
-          - { name: wide-nothin, variant: "four+steady+calm+nothin" }
-          - { name: wide-nothin-quick, variant: "four+steady+calm+nothin+quick" }
-          - { name: pr-nothin, variant: "four+nothin" }
+          - { name: this, variant: "four" }
     services:
       postgres:
         image: postgres:18

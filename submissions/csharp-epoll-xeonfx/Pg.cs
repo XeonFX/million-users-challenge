@@ -26,8 +26,6 @@ struct Waiter
     public byte Kind;
     public bool Last;
     public long Id;
-    /// <summary>When its batch was sealed (a Stopwatch timestamp): how long it has waited counts from here.</summary>
-    public long Sent;
 }
 
 /// <summary>A write waiting for its group's commit, with what its reply needs.</summary>
@@ -56,21 +54,16 @@ sealed class WriteJob
 sealed class Pg
 {
     public const byte Health = (byte)'h', Feed = (byte)'f', Post = (byte)'p', CreatePost = (byte)'c', LikePost = (byte)'l';
-    /// <summary>The most reads under one Sync. A loop pass's reads go to one reader until it holds the loop's current
-    /// batch size, which is at most this.</summary>
+    /// <summary>The most reads under one Sync. A loop pass's reads go to one reader until it holds this many.</summary>
     public const int MaxBatch = 64;
     /// <summary>How long a connection that owes replies may stay silent before it is nudged with a Sync, in
-    /// milliseconds. A batch's rows come 8 KB at a time, a millisecond or so apart, so a reader this quiet has most
-    /// likely lost a packet, and the retransmit timer behind it runs 200 ms or more. A commit waits for its WAL
-    /// flush, so a writer is given longer.</summary>
-    public const int ReadNudgeAfterMs = 5, WriteNudgeAfterMs = 20;
-    /// <summary>The first nudges come this many times at the same interval (a nudge can be lost like any packet, and
-    /// the next one then does its work); from there the interval doubles up to <see cref="NudgeCapMs"/>, so a
-    /// Postgres that is only slow isn't sent Syncs at full rate for ever.</summary>
-    public const int SteadyNudges = 4, NudgeCapMs = 80;
+    /// milliseconds; doubled after each nudge until it answers. A reply normally takes a few milliseconds, so silence
+    /// this long means a lost packet, and the retransmit timer behind it runs 200 ms or more.</summary>
+    public const int NudgeAfterMs = 50;
     /// <summary>A reader that owes replies and has been silent this long counts as stalled: new batches go to the
     /// others (<see cref="Loop.NextReader"/>).</summary>
     public const int StallAfterMs = 4;
+    static readonly long NudgeTicks = Ticks(NudgeAfterMs), StallTicks = Ticks(StallAfterMs);
     /// <summary>How long each answer of the login may take.</summary>
     const int LoginTimeoutMs = 2_000;
     /// <summary>How long a connect may take, from when it was started to when the loop gets to it: a loop logs its
@@ -138,17 +131,12 @@ sealed class Pg
     /// <summary>When the connection last heard from Postgres, or sent work with nothing owed (a Stopwatch
     /// timestamp): how long it has been silent counts from here.</summary>
     long _heard;
-    /// <summary>When the next nudge is due, while it owes replies.</summary>
-    long _nudgeDue;
-    /// <summary>Nudges sent since it last heard from Postgres.</summary>
-    int _nudges;
+    /// <summary>When the next nudge is due while it owes replies, and how long after that one the next.</summary>
+    long _nudgeDue, _nudgeAfter;
     /// <summary>When the reader's last batch was sealed (a Stopwatch timestamp): the readers take turns by it.</summary>
     public long LastUsed { get; private set; }
 
     internal static long Ticks(long ms) => ms * Stopwatch.Frequency / 1000;
-    static readonly long ReadNudgeTicks = Ticks(ReadNudgeAfterMs), WriteNudgeTicks = Ticks(WriteNudgeAfterMs),
-        NudgeCapTicks = Ticks(NudgeCapMs), StallTicks = Ticks(StallAfterMs);
-    long NudgeTicks => _writer ? WriteNudgeTicks : ReadNudgeTicks;
 
     /// <summary>A writer carries groups of writes, one at a time; a reader carries batches of reads.</summary>
     readonly bool _writer;
@@ -394,10 +382,8 @@ sealed class Pg
         if (Open == 0) return;
         if (!Owes) Heard(now);
         LastUsed = now;
-        int last = _waiterHead + _waiterCount - 1;
-        for (int k = 0; k < Open; k++) _waiters[(last - k) % _waiters.Length].Sent = now;
         PutBytes(SyncMessage);
-        _waiters[last % _waiters.Length].Last = true;
+        _waiters[(_waiterHead + _waiterCount - 1) % _waiters.Length].Last = true;
         Open = 0;
         _sealed = _outLength;
     }
@@ -407,7 +393,7 @@ sealed class Pg
     void Heard(long now)
     {
         _heard = now;
-        _nudges = 0;
+        _nudgeAfter = NudgeTicks;
         _nudgeDue = now + NudgeTicks;
     }
 
@@ -419,14 +405,12 @@ sealed class Pg
     /// what is queued behind it waits until it is resent.</summary>
     public bool Stalled(long now) => SilentFor(now) > StallTicks;
 
-    /// <summary>Sends a lone Sync when the connection owes replies and has been silent for
-    /// <see cref="ReadNudgeAfterMs"/> (<see cref="WriteNudgeAfterMs"/> for a writer), and again at that interval
-    /// while it stays silent (<see cref="SteadyNudges"/>). TCP notices a lost packet at once when a later one
-    /// arrives, but a packet with none after it waits for a timer, 200 ms at least and doubling: a batch of
-    /// requests, which is one packet; the end of a reply; a packet lost again when it was resent. The Sync is that
-    /// later packet. It reaches Postgres past the hole, or its ReadyForQuery reaches us past it, and the side that
-    /// sent the lost packet resends it at once. The loop seals the pass's batch before it nudges, so no batch is
-    /// open here. Returns when the next nudge is due (long.MaxValue when nothing is owed).</summary>
+    /// <summary>Sends a lone Sync when the connection owes replies and has been silent since
+    /// <see cref="NudgeAfterMs"/> (twice as long after each nudge). A request or a reply that was lost on the way
+    /// would otherwise wait for its sender's retransmit timer, 200 ms at least: nothing else is in flight on the
+    /// connection to tell either side of the gap. The Sync does: it reaches Postgres past the hole, or its
+    /// ReadyForQuery reaches us past the hole, and can trigger loss detection before the retransmit timer expires.
+    /// Returns when the next nudge is due (long.MaxValue when nothing is owed).</summary>
     public long Nudge(long now)
     {
         if (Broken || !Owes) return long.MaxValue;
@@ -434,10 +418,8 @@ sealed class Pg
         PutBytes(SyncMessage);
         _sealed = _outLength;
         if (_writer) _syncs.Enqueue(false);
-        _nudges++;
-        long interval = NudgeTicks;
-        if (_nudges >= SteadyNudges) interval = Math.Min(interval << Math.Min(_nudges - SteadyNudges + 1, 8), NudgeCapTicks);
-        return _nudgeDue = now + interval;
+        _nudgeAfter *= 2;
+        return _nudgeDue = now + _nudgeAfter;
     }
 
     public Waiter TakeWaiter()
